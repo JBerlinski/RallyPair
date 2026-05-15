@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: rallypair-backend
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
