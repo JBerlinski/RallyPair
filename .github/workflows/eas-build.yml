@@ -43,4 +43,4 @@ jobs:
       - name: Print build URL
         run: |
           echo "Build submitted to EAS! Check progress and download APK at:"
-          echo "https://expo.dev/accounts/JBerlinski/projects/rallypair/builds"
+          echo "https://expo.dev/accounts/jberlinski/projects/rallypair/builds"
