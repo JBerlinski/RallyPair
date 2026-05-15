@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Alert, StatusBar, ActivityIndicator,
 } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
 import LeafletMap from '../components/LeafletMap';
@@ -86,17 +87,14 @@ export default function DriverMapScreen({ navigation, route }) {
   const [currentStep, setCurrentStep] = useState(null);
   const [distToStep, setDistToStep] = useState(null);
 
-  // Load settings and apply tile provider once map is ready
-  useEffect(() => {
+  // Load settings on every focus (picks up changes made in Settings screen)
+  useFocusEffect(useCallback(() => {
     loadSettings().then((s) => {
       settingsRef.current = s;
       const provider = TILE_PROVIDERS.find((p) => p.id === s.tileProvider);
-      if (provider && provider.id !== 'osm') {
-        // Small delay so the map iframe/webview has initialised
-        setTimeout(() => mapRef.current?.setTileUrl(provider.url), 1500);
-      }
+      if (provider) mapRef.current?.setTileUrl(provider.url);
     });
-  }, []);
+  }, []));
 
   // GPS tracking
   useEffect(() => {

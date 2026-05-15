@@ -1,23 +1,22 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  View, Text, TextInput, TouchableOpacity, FlatList,
-  StyleSheet, ActivityIndicator, Alert, KeyboardAvoidingView,
-  Platform, StatusBar,
+  View, Text, TextInput, TouchableOpacity, ScrollView,
+  StyleSheet, ActivityIndicator, Alert, StatusBar, Platform,
 } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
 import { io } from 'socket.io-client';
+import * as Location from 'expo-location';
 import { BACKEND_URL } from '../config';
 import { socketStore } from '../socketStore';
 import { parseLocation } from '../utils/parseLocation';
 import { saveSession, clearSession } from '../utils/sessionStorage';
 import { fetchRoute } from '../utils/osrm';
-import { getCachedSettings, loadSettings } from '../utils/settings';
+import { loadSettings, getCachedSettings, TILE_PROVIDERS } from '../utils/settings';
 import LeafletMap from '../components/LeafletMap';
 
 const STATUS = { CONNECTING: 'connecting', WAITING: 'waiting', PAIRED: 'paired' };
 
 export default function NavigatorScreen({ navigation, route: navRoute }) {
-  // Ensure settings cache is warm
-  useEffect(() => { loadSettings(); }, []);
   const resumeRoomCode = navRoute.params?.resumeRoomCode ?? null;
 
   const socketRef = useRef(null);
@@ -25,6 +24,7 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
   const roomCodeRef = useRef(resumeRoomCode ?? '');
   const needsRejoinRef = useRef(false);
   const firstDriverPos = useRef(false);
+  const settingsRef = useRef(getCachedSettings());
 
   const [status, setStatus] = useState(STATUS.CONNECTING);
   const [roomCode, setRoomCode] = useState('');
@@ -34,6 +34,15 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
   const [sending, setSending] = useState(false);
   const [driverConnected, setDriverConnected] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+
+  // Apply tile provider whenever screen is focused (picks up settings changes)
+  useFocusEffect(useCallback(() => {
+    loadSettings().then((s) => {
+      settingsRef.current = s;
+      const provider = TILE_PROVIDERS.find((p) => p.id === s.tileProvider);
+      if (provider) mapRef.current?.setTileUrl(provider.url);
+    });
+  }, []));
 
   const applyRoomCode = useCallback((code, hasDriver = false) => {
     roomCodeRef.current = code;
@@ -60,7 +69,6 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
         applyRoomCode(res.roomCode, res.hasDriver);
         setReconnecting(false);
       } else {
-        // Room expired — create fresh room
         doCreateRoom(socket);
         setReconnecting(false);
       }
@@ -78,15 +86,12 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
 
     socket.on('connect', () => {
       if (needsRejoinRef.current && roomCodeRef.current) {
-        // Reconnected after drop — try to rejoin
         needsRejoinRef.current = false;
         setReconnecting(true);
         doRejoinOrCreate(socket, roomCodeRef.current);
       } else if (!roomCodeRef.current) {
-        // First connect — no saved session, create new room
         doCreateRoom(socket);
       } else {
-        // First connect with resume code
         doRejoinOrCreate(socket, roomCodeRef.current);
       }
     });
@@ -117,9 +122,7 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
       }
     });
 
-    socket.on('connect_error', () => {
-      // socket.io will keep retrying — no alert needed
-    });
+    socket.on('connect_error', () => {});
 
     return () => {
       socket.disconnect();
@@ -127,6 +130,18 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
       clearSession();
     };
   }, [doCreateRoom, doRejoinOrCreate]);
+
+  // Live route drawing: fetch OSRM whenever waypoints have ≥2 points
+  useEffect(() => {
+    if (waypoints.length < 2) {
+      mapRef.current?.updateRoute([]);
+      return;
+    }
+    fetchRoute(waypoints).then((result) => {
+      if (result) mapRef.current?.updateRoute(result.coordinates);
+      else mapRef.current?.updateRoute([]);
+    });
+  }, [waypoints]);
 
   const handleAddWaypoint = useCallback(async () => {
     if (!locationInput.trim()) return;
@@ -152,68 +167,99 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
     }
   }, [locationInput]);
 
-  const handleRemoveWaypoint = (index) => {
+  const handleRemoveWaypoint = useCallback((index) => {
     setWaypoints((prev) => {
       const updated = prev.filter((_, i) => i !== index);
       mapRef.current?.updateWaypoints(updated);
       return updated;
     });
-  };
+  }, []);
 
   const handleSendRoute = useCallback(async () => {
-    if (waypoints.length === 0) {
-      Alert.alert('Brak punktów', 'Dodaj co najmniej jeden punkt docelowy.');
-      return;
-    }
+    if (waypoints.length === 0) return;
     setSending(true);
     socketRef.current?.emit('send_route', { waypoints });
-
-    // Show route line on navigator map if setting enabled
-    const cfg = getCachedSettings();
-    if (cfg.showRoute && waypoints.length >= 2) {
-      const result = await fetchRoute(waypoints);
-      if (result) mapRef.current?.updateRoute(result.coordinates);
-    }
-
     setTimeout(() => setSending(false), 800);
   }, [waypoints]);
 
-  if (status === STATUS.CONNECTING && !reconnecting) {
-    return (
-      <View style={styles.centered}>
-        <ActivityIndicator size="large" color="#3b82f6" />
-        <Text style={styles.statusText}>Łączenie z serwerem…</Text>
-      </View>
-    );
-  }
+  const handleCenter = useCallback(async () => {
+    try {
+      const { status: perm } = await Location.requestForegroundPermissionsAsync();
+      if (perm !== 'granted') return;
+      const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+      mapRef.current?.panTo(loc.coords.latitude, loc.coords.longitude, 15);
+    } catch {}
+  }, []);
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-    >
-      <StatusBar barStyle="light-content" />
+    <View style={styles.container}>
+      <StatusBar hidden />
+      <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} />
 
-      <View style={styles.upper}>
-        {reconnecting && (
-          <View style={styles.reconnectBanner}>
-            <ActivityIndicator size="small" color="#f59e0b" style={{ marginRight: 8 }} />
-            <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
+      {/* Loading overlay */}
+      {status === STATUS.CONNECTING && !reconnecting && (
+        <View style={styles.loadingOverlay} pointerEvents="none">
+          <ActivityIndicator size="large" color="#3b82f6" />
+          <Text style={styles.loadingText}>Łączenie z serwerem…</Text>
+        </View>
+      )}
+
+      {/* Top bar: room badge + actions */}
+      <View style={styles.topBar} pointerEvents="box-none">
+        <View style={styles.roomBadge}>
+          <View style={[styles.dot,
+            driverConnected ? styles.dotGreen
+            : reconnecting   ? styles.dotAmber
+            : styles.dotGray,
+          ]} />
+          <Text style={styles.roomCodeText}>{roomCode || '——'}</Text>
+        </View>
+        <View style={styles.topActions} pointerEvents="box-none">
+          <TouchableOpacity style={styles.iconBtn} onPress={handleCenter}>
+            <Text style={styles.iconBtnText}>⊙</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.iconBtn} onPress={() => navigation.navigate('Settings')}>
+            <Text style={styles.iconBtnText}>⚙</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      {/* Reconnect banner */}
+      {reconnecting && (
+        <View style={styles.reconnectBanner}>
+          <ActivityIndicator size="small" color="#f59e0b" style={{ marginRight: 8 }} />
+          <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
+        </View>
+      )}
+
+      {/* Bottom sheet: waypoints list + input + send */}
+      <View style={styles.bottomSheet}>
+        {waypoints.length > 0 && (
+          <View style={styles.waypointPanel}>
+            <ScrollView
+              style={{ maxHeight: 200 }}
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+            >
+              {waypoints.map((wp, index) => (
+                <View key={index} style={[styles.waypointRow, index > 0 && styles.waypointBorder]}>
+                  <Text style={styles.waypointIndex}>{index + 1}</Text>
+                  <Text style={styles.waypointLabel} numberOfLines={1}>{wp.label}</Text>
+                  <TouchableOpacity
+                    onPress={() => handleRemoveWaypoint(index)}
+                    style={styles.removeBtn}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  >
+                    <Text style={styles.removeBtnText}>✕</Text>
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </ScrollView>
           </View>
         )}
 
-        <View style={styles.codeBox}>
-          <Text style={styles.codeLabel}>Kod pokoju</Text>
-          <Text style={styles.codeText}>{roomCode || '——'}</Text>
-          <Text style={styles.codeHint}>
-            {reconnecting
-              ? 'Łączenie…'
-              : status === STATUS.WAITING
-                ? 'Czekam na kierowcę…'
-                : '✅ Kierowca połączony'}
-          </Text>
-        </View>
-
+      {/* Bottom input + send bar */}
+      <View style={styles.bottomBar}>
         <View style={styles.inputRow}>
           <TextInput
             style={styles.input}
@@ -232,30 +278,11 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
           </TouchableOpacity>
         </View>
 
-        <FlatList
-          data={waypoints}
-          keyExtractor={(_, i) => i.toString()}
-          style={styles.list}
-          keyboardShouldPersistTaps="handled"
-          renderItem={({ item, index }) => (
-            <View style={styles.waypointRow}>
-              <Text style={styles.waypointIndex}>{index + 1}</Text>
-              <Text style={styles.waypointLabel} numberOfLines={2}>{item.label}</Text>
-              <TouchableOpacity onPress={() => handleRemoveWaypoint(index)} style={styles.removeBtn}>
-                <Text style={styles.removeBtnText}>✕</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-          ListEmptyComponent={
-            <Text style={styles.emptyText}>Brak punktów — dodaj cel lub przystanek</Text>
-          }
-        />
-
-        <View style={styles.actionRow}>
+        {waypoints.length > 0 && (
           <TouchableOpacity
-            style={[styles.sendBtn, (!driverConnected || waypoints.length === 0) && styles.sendBtnDisabled]}
+            style={[styles.sendBtn, !driverConnected && styles.sendBtnDisabled]}
             onPress={handleSendRoute}
-            disabled={!driverConnected || waypoints.length === 0 || sending}
+            disabled={!driverConnected || sending}
           >
             {sending
               ? <ActivityIndicator size="small" color="#fff" />
@@ -263,85 +290,98 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
                   {driverConnected ? 'Wyślij trasę do kierowcy' : 'Czekam na kierowcę…'}
                 </Text>}
           </TouchableOpacity>
-          <TouchableOpacity style={styles.settingsBtn} onPress={() => navigation.navigate('Settings')}>
-            <Text style={styles.settingsBtnText}>⚙</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-
-      <View style={styles.mapContainer}>
-        {!driverConnected && (
-          <View style={styles.mapOverlay} pointerEvents="none">
-            <Text style={styles.mapOverlayText}>Mapa aktywna po dołączeniu kierowcy</Text>
-          </View>
         )}
-        <LeafletMap ref={mapRef} style={styles.map} />
       </View>
-    </KeyboardAvoidingView>
+      </View>
+    </View>
   );
 }
 
+const PANEL_BG = 'rgba(15,23,42,0.88)';
+
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f172a' },
-  centered: { flex: 1, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center' },
-  statusText: { color: '#94a3b8', marginTop: 12, fontSize: 15 },
 
-  reconnectBanner: {
+  loadingOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(15,23,42,0.7)',
+    alignItems: 'center', justifyContent: 'center',
+    zIndex: 50,
+  },
+  loadingText: { color: '#94a3b8', marginTop: 12, fontSize: 15 },
+
+  // Top bar
+  topBar: {
+    position: 'absolute', top: 14, left: 14, right: 14,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    zIndex: 10,
+  },
+  roomBadge: {
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: '#78350f', borderRadius: 8,
-    padding: 10, marginBottom: 10,
+    backgroundColor: PANEL_BG,
+    borderRadius: 20, paddingHorizontal: 12, paddingVertical: 7,
+  },
+  dot: { width: 8, height: 8, borderRadius: 4, marginRight: 7 },
+  dotGreen: { backgroundColor: '#22c55e' },
+  dotAmber: { backgroundColor: '#f59e0b' },
+  dotGray:  { backgroundColor: '#475569' },
+  roomCodeText: { color: '#f1f5f9', fontSize: 15, fontWeight: '700', letterSpacing: 2 },
+  topActions: { flexDirection: 'row', gap: 8 },
+  iconBtn: {
+    width: 40, height: 40, borderRadius: 20,
+    backgroundColor: PANEL_BG,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  iconBtnText: { fontSize: 18, color: '#f1f5f9' },
+
+  // Reconnect
+  reconnectBanner: {
+    position: 'absolute', top: 70, left: 14, right: 14,
+    backgroundColor: '#78350f', borderRadius: 10,
+    paddingHorizontal: 14, paddingVertical: 10,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+    zIndex: 10,
   },
   reconnectText: { color: '#fef3c7', fontSize: 13 },
 
-  upper: { flex: 1, padding: 16 },
-
-  codeBox: {
-    backgroundColor: '#1e293b', borderRadius: 12, padding: 12,
-    alignItems: 'center', marginBottom: 12, marginTop: 4,
+  // Bottom sheet (wraps waypoints + input + send)
+  bottomSheet: {
+    position: 'absolute', bottom: 0, left: 0, right: 0,
+    backgroundColor: PANEL_BG,
+    borderTopLeftRadius: 16, borderTopRightRadius: 16,
+    overflow: 'hidden', zIndex: 10,
   },
-  codeLabel: { color: '#94a3b8', fontSize: 11, marginBottom: 2 },
-  codeText: { color: '#f1f5f9', fontSize: 40, fontWeight: '800', letterSpacing: 8 },
-  codeHint: { color: '#64748b', fontSize: 12, marginTop: 4 },
+  waypointPanel: {
+    borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.06)',
+  },
+  waypointRow: {
+    flexDirection: 'row', alignItems: 'center',
+    paddingHorizontal: 14, paddingVertical: 10,
+  },
+  waypointBorder: { borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)' },
+  waypointIndex: { color: '#3b82f6', fontWeight: '700', fontSize: 13, width: 20, marginRight: 10 },
+  waypointLabel: { flex: 1, color: '#e2e8f0', fontSize: 13 },
+  removeBtn: { paddingLeft: 8 },
+  removeBtnText: { color: '#ef4444', fontSize: 14 },
 
-  inputRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
+  // Input + send section
+  bottomBar: {
+    paddingHorizontal: 14, paddingTop: 12, paddingBottom: Platform.OS === 'ios' ? 28 : 16,
+  },
+  inputRow: { flexDirection: 'row', gap: 8, marginBottom: 0 },
   input: {
-    flex: 1, backgroundColor: '#1e293b', borderRadius: 10,
+    flex: 1, backgroundColor: 'rgba(255,255,255,0.07)', borderRadius: 10,
     color: '#f1f5f9', paddingHorizontal: 14, paddingVertical: 11, fontSize: 14,
   },
   addBtn: {
     backgroundColor: '#2563eb', borderRadius: 10,
-    width: 48, alignItems: 'center', justifyContent: 'center',
+    width: 46, alignItems: 'center', justifyContent: 'center',
   },
-  addBtnText: { color: '#fff', fontSize: 24, fontWeight: '700' },
-
-  list: { flex: 1 },
-  waypointRow: {
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: '#1e293b', borderRadius: 10,
-    padding: 10, marginBottom: 6,
+  addBtnText: { color: '#fff', fontSize: 26, fontWeight: '700', lineHeight: 30 },
+  sendBtn: {
+    backgroundColor: '#059669', borderRadius: 12,
+    padding: 14, alignItems: 'center', marginTop: 10,
   },
-  waypointIndex: { color: '#3b82f6', fontWeight: '700', fontSize: 15, width: 22, textAlign: 'center', marginRight: 8 },
-  waypointLabel: { flex: 1, color: '#e2e8f0', fontSize: 13 },
-  removeBtn: { padding: 6 },
-  removeBtnText: { color: '#ef4444', fontSize: 15 },
-  emptyText: { color: '#334155', textAlign: 'center', marginTop: 16, fontSize: 13 },
-
-  actionRow: { flexDirection: 'row', gap: 8, marginTop: 6 },
-  sendBtn: { flex: 1, backgroundColor: '#059669', borderRadius: 12, padding: 14, alignItems: 'center' },
   sendBtnDisabled: { backgroundColor: '#1e293b' },
   sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
-  settingsBtn: {
-    width: 50, backgroundColor: '#1e293b', borderRadius: 12,
-    alignItems: 'center', justifyContent: 'center',
-  },
-  settingsBtnText: { fontSize: 20, color: '#94a3b8' },
-
-  mapContainer: { height: 220 },
-  map: { flex: 1 },
-  mapOverlay: {
-    ...StyleSheet.absoluteFillObject, zIndex: 10,
-    backgroundColor: 'rgba(15,23,42,0.75)',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  mapOverlayText: { color: '#475569', fontSize: 13 },
 });

@@ -13,6 +13,16 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     html,body,#map{width:100%;height:100%;background:#1e293b}
+    #compass{
+      width:40px;height:40px;
+      background:rgba(15,23,42,0.85);
+      border-radius:50%;
+      display:flex;align-items:center;justify-content:center;
+      cursor:pointer;
+      box-shadow:0 2px 6px rgba(0,0,0,0.4);
+      margin-bottom:8px;
+      transition:transform 0.25s ease;
+    }
   </style>
 </head>
 <body>
@@ -21,12 +31,30 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
     var map = L.map('map',{
       rotate: true,
       bearing: 0,
-      zoomControl: true,
+      zoomControl: false,
       attributionControl: false
     }).setView([52.237,21.017],12);
 
     var tileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
     var driverMarker=null, waypointMarkers=[], routeLine=null;
+    var currentBearing = 0;
+
+    // Compass control
+    var CompassControl = L.Control.extend({
+      options: { position: 'bottomright' },
+      onAdd: function() {
+        var div = L.DomUtil.create('div');
+        div.id = 'compass';
+        div.innerHTML = '<svg id="compass-svg" width="22" height="22" viewBox="0 0 22 22">'
+          + '<polygon points="11,2 13.5,10 11,8.5 8.5,10" fill="#ef4444"/>'
+          + '<polygon points="11,20 13.5,12 11,13.5 8.5,12" fill="#64748b"/>'
+          + '</svg>';
+        L.DomEvent.on(div,'click',L.DomEvent.stopPropagation);
+        L.DomEvent.on(div,'click',function(){ setBearing(0); });
+        return div;
+      }
+    });
+    new CompassControl().addTo(map);
 
     function mkDriverIcon(heading){
       var hasHdg = heading != null && !isNaN(heading) && heading >= 0;
@@ -55,7 +83,10 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
     }
 
     function setBearing(deg){
+      currentBearing = deg;
       try{ if(map.setBearing) map.setBearing(deg); }catch(e){}
+      var svg = document.getElementById('compass-svg');
+      if(svg) svg.style.transform = 'rotate('+(-deg)+'deg)';
     }
 
     function setTileUrl(url){
