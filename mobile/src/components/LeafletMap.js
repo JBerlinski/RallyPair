@@ -29,11 +29,16 @@ const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
   }, []);
 
   useImperativeHandle(ref, () => ({
-    updateDriver(lat, lng) { exec(`updateDriver(${lat},${lng})`); },
+    updateDriver(lat, lng, heading) {
+      const h = heading != null ? heading : 'undefined';
+      exec(`updateDriver(${lat},${lng},${h})`);
+    },
     updateWaypoints(wps) { exec(`updateWaypoints(${JSON.stringify(wps)})`); },
-    updateRoute(coords) { exec(`updateRoute(${JSON.stringify(coords)})`); },
-    fitRoute(coords) { exec(`fitRoute(${JSON.stringify(coords)})`); },
-    panTo(lat, lng, zoom) { exec(`panTo(${lat},${lng},${zoom != null ? zoom : 'undefined'})`); },
+    updateRoute(coords)  { exec(`updateRoute(${JSON.stringify(coords)})`); },
+    fitRoute(coords)     { exec(`fitRoute(${JSON.stringify(coords)})`); },
+    panTo(lat, lng, zoom){ exec(`panTo(${lat},${lng},${zoom != null ? zoom : 'undefined'})`); },
+    setBearing(deg)      { exec(`setBearing(${deg})`); },
+    setTileUrl(url)      { exec(`setTileUrl(${JSON.stringify(url)})`); },
   }), [exec]);
 
   return (

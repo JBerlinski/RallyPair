@@ -33,11 +33,13 @@ const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
   }
 
   useImperativeHandle(ref, () => ({
-    updateDriver(lat, lng) { send({ t: 'driver', lat, lng }); },
-    updateWaypoints(wps) { send({ t: 'waypoints', wps }); },
-    updateRoute(coords) { send({ t: 'route', coords }); },
-    fitRoute(coords) { send({ t: 'fit', coords }); },
-    panTo(lat, lng, zoom) { send({ t: 'pan', lat, lng, zoom }); },
+    updateDriver(lat, lng, heading) { send({ t: 'driver', lat, lng, heading: heading ?? null }); },
+    updateWaypoints(wps)            { send({ t: 'waypoints', wps }); },
+    updateRoute(coords)             { send({ t: 'route', coords }); },
+    fitRoute(coords)                { send({ t: 'fit', coords }); },
+    panTo(lat, lng, zoom)           { send({ t: 'pan', lat, lng, zoom: zoom ?? null }); },
+    setBearing(deg)                 { send({ t: 'bearing', deg }); },
+    setTileUrl(url)                 { send({ t: 'tile', url }); },
   }));
 
   const containerStyle = {

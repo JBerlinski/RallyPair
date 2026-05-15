@@ -28,6 +28,7 @@ export async function fetchRoute(waypoints) {
         instruction: step.maneuver.type,
         modifier: step.maneuver.modifier,
         name: step.name,
+        ref: step.ref || null,
         distance: step.distance,
         duration: step.duration,
         location: {

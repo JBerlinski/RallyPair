@@ -9,6 +9,7 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-rotate@0.2.8/dist/leaflet-rotate-src.js"></script>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     html,body,#map{width:100%;height:100%;background:#1e293b}
@@ -17,23 +18,49 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
 <body>
   <div id="map"></div>
   <script>
-    var map = L.map('map',{zoomControl:true,attributionControl:false}).setView([52.237,21.017],12);
-    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
+    var map = L.map('map',{
+      rotate: true,
+      bearing: 0,
+      zoomControl: true,
+      attributionControl: false
+    }).setView([52.237,21.017],12);
 
+    var tileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
     var driverMarker=null, waypointMarkers=[], routeLine=null;
 
-    function mkDriverIcon(){
-      return L.divIcon({
-        className:'',
-        html:'<div style="width:16px;height:16px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5)"></div>',
-        iconSize:[16,16],iconAnchor:[8,8]
-      });
+    function mkDriverIcon(heading){
+      var hasHdg = heading != null && !isNaN(heading) && heading >= 0;
+      if(hasHdg){
+        var rot = Math.round(heading);
+        var html = '<div style="transform:rotate('+rot+'deg);transform-origin:center;width:32px;height:32px">'
+          +'<svg width="32" height="32" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">'
+          +'<circle cx="16" cy="16" r="14" fill="rgba(59,130,246,0.22)" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>'
+          +'<polygon points="16,3 23,25 16,20 9,25" fill="#3b82f6" stroke="#ffffff" stroke-width="1.5" stroke-linejoin="round"/>'
+          +'</svg></div>';
+        return L.divIcon({className:'',html:html,iconSize:[32,32],iconAnchor:[16,16]});
+      }
+      var dot = '<div style="width:16px;height:16px;border-radius:50%;background:#3b82f6;border:3px solid #fff;box-shadow:0 0 6px rgba(0,0,0,.5)"></div>';
+      return L.divIcon({className:'',html:dot,iconSize:[16,16],iconAnchor:[8,8]});
     }
 
-    function updateDriver(lat,lng){
+    function updateDriver(lat,lng,heading){
       var ll=[lat,lng];
-      if(driverMarker){ driverMarker.setLatLng(ll); }
-      else { driverMarker=L.marker(ll,{icon:mkDriverIcon(),zIndexOffset:1000}).addTo(map); }
+      var icon=mkDriverIcon(heading);
+      if(driverMarker){
+        driverMarker.setLatLng(ll);
+        driverMarker.setIcon(icon);
+      } else {
+        driverMarker=L.marker(ll,{icon:icon,zIndexOffset:1000}).addTo(map);
+      }
+    }
+
+    function setBearing(deg){
+      try{ if(map.setBearing) map.setBearing(deg); }catch(e){}
+    }
+
+    function setTileUrl(url){
+      map.removeLayer(tileLayer);
+      tileLayer=L.tileLayer(url,{maxZoom:19}).addTo(map);
     }
 
     function updateWaypoints(wps){
@@ -74,11 +101,13 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
     window.addEventListener('message',function(e){
       try{
         var msg=JSON.parse(e.data);
-        if(msg.t==='driver') updateDriver(msg.lat,msg.lng);
+        if(msg.t==='driver')    updateDriver(msg.lat,msg.lng,msg.heading);
         else if(msg.t==='waypoints') updateWaypoints(msg.wps);
-        else if(msg.t==='route') updateRoute(msg.coords);
-        else if(msg.t==='fit') fitRoute(msg.coords);
-        else if(msg.t==='pan') panTo(msg.lat,msg.lng,msg.zoom);
+        else if(msg.t==='route')     updateRoute(msg.coords);
+        else if(msg.t==='fit')       fitRoute(msg.coords);
+        else if(msg.t==='pan')       panTo(msg.lat,msg.lng,msg.zoom);
+        else if(msg.t==='bearing')   setBearing(msg.deg);
+        else if(msg.t==='tile')      setTileUrl(msg.url);
       }catch(err){}
     });
 

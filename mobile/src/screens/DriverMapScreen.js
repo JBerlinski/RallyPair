@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, Alert, StatusBar, ActivityIndicator,
 } from 'react-native';
@@ -8,10 +8,66 @@ import LeafletMap from '../components/LeafletMap';
 import { socketStore } from '../socketStore';
 import { clearSession } from '../utils/sessionStorage';
 import { fetchRoute } from '../utils/osrm';
+import { loadSettings, getCachedSettings, TILE_PROVIDERS } from '../utils/settings';
 
 const POSITION_INTERVAL_MS = 3000;
 
-export default function DriverMapScreen({ route }) {
+function haversine(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const f1 = (lat1 * Math.PI) / 180;
+  const f2 = (lat2 * Math.PI) / 180;
+  const df = ((lat2 - lat1) * Math.PI) / 180;
+  const dl = ((lng2 - lng1) * Math.PI) / 180;
+  const a = Math.sin(df / 2) ** 2 + Math.cos(f1) * Math.cos(f2) * Math.sin(dl / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function getThreshold(ref) {
+  if (!ref) return 150;
+  if (/^A\d/i.test(ref)) return 500;
+  if (/^S\d/i.test(ref)) return 500;
+  if (/^DK\d/i.test(ref)) return 300;
+  return 150;
+}
+
+function maneuverIcon(instruction, modifier) {
+  const m = modifier || '';
+  switch (instruction) {
+    case 'turn':
+      if (m.includes('sharp left'))  return '↰';
+      if (m.includes('sharp right')) return '↱';
+      if (m.includes('slight left')) return '↖';
+      if (m.includes('slight right'))return '↗';
+      if (m.includes('uturn'))       return '↩';
+      if (m.includes('left'))        return '←';
+      if (m.includes('right'))       return '→';
+      return '↑';
+    case 'continue':  return '↑';
+    case 'depart':    return '▶';
+    case 'arrive':    return '⊙';
+    case 'roundabout':
+    case 'rotary':    return '↻';
+    case 'fork':
+      if (m.includes('left'))  return '↰';
+      if (m.includes('right')) return '↱';
+      return '↑';
+    case 'merge':
+    case 'on ramp':
+    case 'off ramp':
+    case 'end of road':
+      if (m.includes('left'))  return '←';
+      if (m.includes('right')) return '→';
+      return '↑';
+    default: return '↑';
+  }
+}
+
+function fmtDist(m) {
+  if (m >= 950) return `${(m / 1000).toFixed(1)} km`;
+  return `${Math.round(m / 10) * 10} m`;
+}
+
+export default function DriverMapScreen({ navigation, route }) {
   const { roomCode } = route.params;
   const socket = socketStore.getDriver();
   const mapRef = useRef(null);
@@ -19,13 +75,28 @@ export default function DriverMapScreen({ route }) {
   const lastSentRef = useRef(0);
   const lastPositionRef = useRef(null);
   const routeCoordsRef = useRef([]);
+  const stepsRef = useRef([]);
+  const stepIdxRef = useRef(0);
   const needsRejoinRef = useRef(false);
+  const settingsRef = useRef(getCachedSettings());
 
   const [connected, setConnected] = useState(true);
   const [reconnecting, setReconnecting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('Czekam na trasę od nawigatora…');
   const [currentStep, setCurrentStep] = useState(null);
-  const [overview, setOverview] = useState(false);
+  const [distToStep, setDistToStep] = useState(null);
+
+  // Load settings and apply tile provider once map is ready
+  useEffect(() => {
+    loadSettings().then((s) => {
+      settingsRef.current = s;
+      const provider = TILE_PROVIDERS.find((p) => p.id === s.tileProvider);
+      if (provider && provider.id !== 'osm') {
+        // Small delay so the map iframe/webview has initialised
+        setTimeout(() => mapRef.current?.setTileUrl(provider.url), 1500);
+      }
+    });
+  }, []);
 
   // GPS tracking
   useEffect(() => {
@@ -39,10 +110,35 @@ export default function DriverMapScreen({ route }) {
         { accuracy: Location.Accuracy.High, timeInterval: POSITION_INTERVAL_MS, distanceInterval: 5 },
         (loc) => {
           if (!active) return;
-          const { latitude, longitude } = loc.coords;
+          const { latitude, longitude, heading } = loc.coords;
+          const hdg = (heading != null && heading >= 0) ? heading : null;
 
-          mapRef.current?.updateDriver(latitude, longitude);
+          mapRef.current?.updateDriver(latitude, longitude, hdg);
+
+          const cfg = settingsRef.current;
+          if (cfg.compassRotation && hdg != null) mapRef.current?.setBearing(hdg);
+          if (cfg.autoCenter) mapRef.current?.panTo(latitude, longitude);
+
           lastPositionRef.current = { lat: latitude, lng: longitude };
+
+          // Advance route steps
+          const steps = stepsRef.current;
+          if (steps.length > 0) {
+            const idx = stepIdxRef.current;
+            if (idx < steps.length) {
+              const step = steps[idx];
+              const dist = haversine(latitude, longitude, step.location.latitude, step.location.longitude);
+              setDistToStep(dist);
+              const threshold = getThreshold(step.ref);
+              if (dist < threshold && idx + 1 < steps.length) {
+                stepIdxRef.current = idx + 1;
+                setCurrentStep(steps[idx + 1]);
+                setDistToStep(null);
+              } else {
+                setCurrentStep(step);
+              }
+            }
+          }
 
           const now = Date.now();
           if (now - lastSentRef.current < POSITION_INTERVAL_MS) return;
@@ -57,26 +153,21 @@ export default function DriverMapScreen({ route }) {
     };
   }, [socket]);
 
-  // WebSocket listeners + reconnect logic
+  // Socket listeners + reconnect
   useEffect(() => {
-    if (!socket) {
-      setStatusMsg('Brak połączenia z serwerem.');
-      return;
-    }
+    if (!socket) { setStatusMsg('Brak połączenia z serwerem.'); return; }
 
     const onRouteUpdate = async (payload) => {
       const { waypoints: wps } = payload;
-      console.log('[DriverMap] route_update, waypoints:', wps?.length ?? 0);
       if (!wps?.length) return;
 
       setStatusMsg('Wyznaczam trasę…');
       mapRef.current?.updateWaypoints(wps);
 
       const origin = lastPositionRef.current;
-      const routePoints = origin ? [origin, ...wps] : wps;
-      console.log('[DriverMap] fetchRoute with', routePoints.length, 'points, origin:', !!origin);
+      const pts = origin ? [origin, ...wps] : wps;
+      const result = await fetchRoute(pts);
 
-      const result = await fetchRoute(routePoints);
       if (!result) {
         setStatusMsg(origin
           ? 'Nie udało się wyznaczyć trasy — sprawdź połączenie.'
@@ -85,7 +176,10 @@ export default function DriverMapScreen({ route }) {
       }
 
       routeCoordsRef.current = result.coordinates;
+      stepsRef.current = result.steps;
+      stepIdxRef.current = 0;
       setCurrentStep(result.steps[0] ?? null);
+      setDistToStep(null);
       setStatusMsg('');
       mapRef.current?.updateRoute(result.coordinates);
       mapRef.current?.fitRoute(result.coordinates);
@@ -100,9 +194,8 @@ export default function DriverMapScreen({ route }) {
       Alert.alert('Rozłączono', 'Nawigator zakończył sesję.');
     };
 
-    const onNavigatorReconnecting = () => {
+    const onNavigatorReconnecting = () =>
       setStatusMsg('Nawigator się rozłączył, próba ponownego połączenia…');
-    };
 
     const onNavigatorRejoined = () => {
       setStatusMsg('Nawigator ponownie połączony.');
@@ -123,9 +216,7 @@ export default function DriverMapScreen({ route }) {
           setReconnecting(false);
           if (!res?.ok) {
             clearSession();
-            Alert.alert('Sesja wygasła', 'Pokój nie istnieje. Wróć do menu.', [
-              { text: 'OK', onPress: () => {} },
-            ]);
+            Alert.alert('Sesja wygasła', 'Pokój nie istnieje. Wróć do menu.');
             setStatusMsg('Sesja wygasła.');
           } else {
             setStatusMsg('');
@@ -155,92 +246,126 @@ export default function DriverMapScreen({ route }) {
     };
   }, [socket, roomCode]);
 
-  const handleOverviewToggle = () => {
-    setOverview((v) => {
-      const next = !v;
-      if (next && routeCoordsRef.current.length > 0) mapRef.current?.fitRoute(routeCoordsRef.current);
-      return next;
-    });
-  };
+  const handleCenter = useCallback(() => {
+    if (lastPositionRef.current) {
+      const { lat, lng } = lastPositionRef.current;
+      mapRef.current?.panTo(lat, lng, 16);
+    }
+  }, []);
+
+  const handleSettings = useCallback(() => navigation.navigate('Settings'), [navigation]);
+
+  const arrived = currentStep?.instruction === 'arrive';
 
   return (
     <View style={styles.container}>
       <StatusBar hidden />
       <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} />
 
-      <View style={styles.topBar}>
-        <Text style={styles.roomCode}>Pokój: {roomCode}</Text>
-        {reconnecting
-          ? <ActivityIndicator size="small" color="#f59e0b" />
-          : <View style={[styles.dot, connected ? styles.dotGreen : styles.dotRed]} />}
-      </View>
-
-      {reconnecting && (
-        <View style={styles.reconnectBanner}>
-          <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
-        </View>
-      )}
-
-      {currentStep && !overview && !reconnecting && (
-        <View style={styles.instructionBox}>
-          <Text style={styles.instructionText}>
-            {currentStep.modifier
-              ? `${currentStep.instruction} ${currentStep.modifier}`
-              : currentStep.instruction}
-            {currentStep.name ? ` → ${currentStep.name}` : ''}
+      {/* Maneuver island — top, full width */}
+      {currentStep && !reconnecting && (
+        <View style={styles.maneuverIsland}>
+          <Text style={styles.maneuverIcon}>
+            {arrived ? '🏁' : maneuverIcon(currentStep.instruction, currentStep.modifier)}
           </Text>
-          <Text style={styles.instructionDist}>{Math.round(currentStep.distance)} m</Text>
+          <View style={styles.maneuverBody}>
+            <Text style={styles.maneuverName} numberOfLines={1}>
+              {arrived
+                ? 'Dotarłeś do celu'
+                : (currentStep.name || currentStep.modifier || currentStep.instruction)}
+            </Text>
+          </View>
+          {!arrived && (
+            <Text style={styles.maneuverDist}>
+              {distToStep != null ? fmtDist(distToStep) : fmtDist(currentStep.distance)}
+            </Text>
+          )}
         </View>
       )}
 
+      {/* Status message (no route yet) */}
       {statusMsg !== '' && !reconnecting && (
-        <View style={styles.statusBox}>
+        <View style={[styles.maneuverIsland, styles.statusIsland]}>
           <Text style={styles.statusText}>{statusMsg}</Text>
         </View>
       )}
 
-      <TouchableOpacity style={styles.overviewBtn} onPress={handleOverviewToggle}>
-        <Text style={styles.overviewBtnText}>{overview ? '📍 Nawigacja' : '🗺 Cała mapa'}</Text>
-      </TouchableOpacity>
+      {/* Reconnect banner */}
+      {reconnecting && (
+        <View style={styles.reconnectBanner}>
+          <ActivityIndicator size="small" color="#f59e0b" style={{ marginRight: 8 }} />
+          <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
+        </View>
+      )}
+
+      {/* Room badge — bottom-left */}
+      <View style={styles.roomBadge}>
+        {reconnecting
+          ? <ActivityIndicator size="small" color="#f59e0b" />
+          : <View style={[styles.dot, connected ? styles.dotGreen : styles.dotRed]} />}
+        <Text style={styles.roomCode}>{roomCode}</Text>
+      </View>
+
+      {/* FABs — bottom-right column */}
+      <View style={styles.fabCol}>
+        <TouchableOpacity style={styles.fab} onPress={handleCenter}>
+          <Text style={styles.fabIcon}>⊙</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.fab} onPress={handleSettings}>
+          <Text style={styles.fabIcon}>⚙</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000' },
-  topBar: {
-    position: 'absolute', top: 12, left: 12, right: 12,
+
+  maneuverIsland: {
+    position: 'absolute', top: 14, left: 14, right: 14,
+    backgroundColor: 'rgba(15,23,42,0.93)',
+    borderRadius: 16, paddingHorizontal: 16, paddingVertical: 14,
     flexDirection: 'row', alignItems: 'center',
-    backgroundColor: 'rgba(15,23,42,0.85)', borderRadius: 10,
-    paddingHorizontal: 14, paddingVertical: 8,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.45, shadowRadius: 8, elevation: 10,
   },
-  roomCode: { color: '#94a3b8', fontSize: 13, flex: 1 },
-  dot: { width: 10, height: 10, borderRadius: 5 },
-  dotGreen: { backgroundColor: '#22c55e' },
-  dotRed: { backgroundColor: '#ef4444' },
+  statusIsland: { backgroundColor: 'rgba(15,23,42,0.82)' },
+  maneuverIcon: { fontSize: 28, marginRight: 12 },
+  maneuverBody: { flex: 1 },
+  maneuverName: { color: '#f1f5f9', fontSize: 14, fontWeight: '600' },
+  maneuverDist: { color: '#3b82f6', fontSize: 17, fontWeight: '800', marginLeft: 10 },
+  statusText: { color: '#94a3b8', fontSize: 14, flex: 1, textAlign: 'center' },
+
   reconnectBanner: {
-    position: 'absolute', top: 52, left: 12, right: 12,
-    backgroundColor: '#78350f', borderRadius: 8,
-    padding: 10, alignItems: 'center',
+    position: 'absolute', top: 84, left: 12, right: 12,
+    backgroundColor: '#78350f', borderRadius: 10,
+    paddingHorizontal: 14, paddingVertical: 10,
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
   },
   reconnectText: { color: '#fef3c7', fontSize: 13 },
-  instructionBox: {
-    position: 'absolute', bottom: 90, left: 12, right: 12,
-    backgroundColor: 'rgba(15,23,42,0.92)', borderRadius: 14,
-    padding: 16, flexDirection: 'row', alignItems: 'center',
+
+  roomBadge: {
+    position: 'absolute', bottom: 28, left: 16,
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: 'rgba(15,23,42,0.82)',
+    borderRadius: 20, paddingHorizontal: 12, paddingVertical: 7,
   },
-  instructionText: { color: '#f1f5f9', fontSize: 15, fontWeight: '600', flex: 1 },
-  instructionDist: { color: '#3b82f6', fontSize: 15, fontWeight: '700', marginLeft: 8 },
-  statusBox: {
-    position: 'absolute', bottom: 90, left: 12, right: 12,
-    backgroundColor: 'rgba(15,23,42,0.85)', borderRadius: 12,
-    padding: 14, alignItems: 'center',
-  },
-  statusText: { color: '#94a3b8', fontSize: 14 },
-  overviewBtn: {
+  dot: { width: 8, height: 8, borderRadius: 4, marginRight: 7 },
+  dotGreen: { backgroundColor: '#22c55e' },
+  dotRed: { backgroundColor: '#ef4444' },
+  roomCode: { color: '#94a3b8', fontSize: 13, fontWeight: '600', letterSpacing: 1 },
+
+  fabCol: {
     position: 'absolute', bottom: 28, right: 16,
-    backgroundColor: 'rgba(15,23,42,0.9)', borderRadius: 24,
-    paddingHorizontal: 18, paddingVertical: 12,
+    gap: 12,
   },
-  overviewBtnText: { color: '#f1f5f9', fontSize: 14, fontWeight: '600' },
+  fab: {
+    width: 52, height: 52, borderRadius: 26,
+    backgroundColor: 'rgba(15,23,42,0.9)',
+    alignItems: 'center', justifyContent: 'center',
+    shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.4, shadowRadius: 4, elevation: 6,
+  },
+  fabIcon: { fontSize: 22, color: '#f1f5f9' },
 });

@@ -9,11 +9,15 @@ import { BACKEND_URL } from '../config';
 import { socketStore } from '../socketStore';
 import { parseLocation } from '../utils/parseLocation';
 import { saveSession, clearSession } from '../utils/sessionStorage';
+import { fetchRoute } from '../utils/osrm';
+import { getCachedSettings, loadSettings } from '../utils/settings';
 import LeafletMap from '../components/LeafletMap';
 
 const STATUS = { CONNECTING: 'connecting', WAITING: 'waiting', PAIRED: 'paired' };
 
 export default function NavigatorScreen({ navigation, route: navRoute }) {
+  // Ensure settings cache is warm
+  useEffect(() => { loadSettings(); }, []);
   const resumeRoomCode = navRoute.params?.resumeRoomCode ?? null;
 
   const socketRef = useRef(null);
@@ -156,13 +160,21 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
     });
   };
 
-  const handleSendRoute = useCallback(() => {
+  const handleSendRoute = useCallback(async () => {
     if (waypoints.length === 0) {
       Alert.alert('Brak punktów', 'Dodaj co najmniej jeden punkt docelowy.');
       return;
     }
     setSending(true);
     socketRef.current?.emit('send_route', { waypoints });
+
+    // Show route line on navigator map if setting enabled
+    const cfg = getCachedSettings();
+    if (cfg.showRoute && waypoints.length >= 2) {
+      const result = await fetchRoute(waypoints);
+      if (result) mapRef.current?.updateRoute(result.coordinates);
+    }
+
     setTimeout(() => setSending(false), 800);
   }, [waypoints]);
 
@@ -239,17 +251,22 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
           }
         />
 
-        <TouchableOpacity
-          style={[styles.sendBtn, (!driverConnected || waypoints.length === 0) && styles.sendBtnDisabled]}
-          onPress={handleSendRoute}
-          disabled={!driverConnected || waypoints.length === 0 || sending}
-        >
-          {sending
-            ? <ActivityIndicator size="small" color="#fff" />
-            : <Text style={styles.sendBtnText}>
-                {driverConnected ? 'Wyślij trasę do kierowcy' : 'Czekam na kierowcę…'}
-              </Text>}
-        </TouchableOpacity>
+        <View style={styles.actionRow}>
+          <TouchableOpacity
+            style={[styles.sendBtn, (!driverConnected || waypoints.length === 0) && styles.sendBtnDisabled]}
+            onPress={handleSendRoute}
+            disabled={!driverConnected || waypoints.length === 0 || sending}
+          >
+            {sending
+              ? <ActivityIndicator size="small" color="#fff" />
+              : <Text style={styles.sendBtnText}>
+                  {driverConnected ? 'Wyślij trasę do kierowcy' : 'Czekam na kierowcę…'}
+                </Text>}
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.settingsBtn} onPress={() => navigation.navigate('Settings')}>
+            <Text style={styles.settingsBtnText}>⚙</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <View style={styles.mapContainer}>
@@ -309,9 +326,15 @@ const styles = StyleSheet.create({
   removeBtnText: { color: '#ef4444', fontSize: 15 },
   emptyText: { color: '#334155', textAlign: 'center', marginTop: 16, fontSize: 13 },
 
-  sendBtn: { backgroundColor: '#059669', borderRadius: 12, padding: 14, alignItems: 'center', marginTop: 6 },
+  actionRow: { flexDirection: 'row', gap: 8, marginTop: 6 },
+  sendBtn: { flex: 1, backgroundColor: '#059669', borderRadius: 12, padding: 14, alignItems: 'center' },
   sendBtnDisabled: { backgroundColor: '#1e293b' },
   sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+  settingsBtn: {
+    width: 50, backgroundColor: '#1e293b', borderRadius: 12,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  settingsBtnText: { fontSize: 20, color: '#94a3b8' },
 
   mapContainer: { height: 220 },
   map: { flex: 1 },
