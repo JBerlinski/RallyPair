@@ -2,26 +2,32 @@ import React, { useRef, forwardRef, useImperativeHandle, useEffect } from 'react
 import { LEAFLET_MAP_HTML } from './leafletMapHtml';
 
 // Web implementation — <iframe srcDoc> + postMessage
-// Metro picks this file on web; LeafletMap.js (WebView) is used on native
 
-const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
+const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) {
   const iframeRef = useRef(null);
   const readyRef = useRef(false);
   const queueRef = useRef([]);
 
   useEffect(() => {
     const handler = (event) => {
+      // Only handle messages that originate from our iframe
+      if (event.source !== iframeRef.current?.contentWindow) return;
       if (event.data === 'ready') {
         readyRef.current = true;
         const pending = queueRef.current.splice(0);
         pending.forEach((msg) => {
           iframeRef.current?.contentWindow?.postMessage(msg, '*');
         });
+      } else {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg?.t) onMapMessage?.(msg);
+        } catch {}
       }
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
-  }, []);
+  }, [onMapMessage]);
 
   function send(obj) {
     const msg = JSON.stringify(obj);
@@ -40,14 +46,14 @@ const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
     panTo(lat, lng, zoom)           { send({ t: 'pan', lat, lng, zoom: zoom ?? null }); },
     setBearing(deg)                 { send({ t: 'bearing', deg }); },
     setTileUrl(url)                 { send({ t: 'tile', url }); },
+    editWaypoint(index)             { send({ t: 'editWp', index }); },
+    cancelEditWaypoint()            { send({ t: 'cancelEdit' }); },
+    confirmEditWaypoint()           { send({ t: 'confirmEdit' }); },
   }));
 
   const containerStyle = {
-    width: '100%',
-    height: '100%',
-    overflow: 'hidden',
-    backgroundColor: '#1e293b',
-    ...(style || {}),
+    width: '100%', height: '100%', overflow: 'hidden',
+    backgroundColor: '#1e293b', ...(style || {}),
   };
 
   return (
