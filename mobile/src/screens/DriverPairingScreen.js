@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, ActivityIndicator, Alert, StatusBar,
+  KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
@@ -46,7 +47,10 @@ export default function DriverPairingScreen({ navigation }) {
   };
 
   return (
-    <View style={styles.container}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'padding'}
+    >
       <StatusBar barStyle="light-content" />
       <Text style={styles.title}>Dołącz jako kierowca</Text>
       <Text style={styles.subtitle}>Wpisz 6-cyfrowy kod od nawigatora</Text>
@@ -72,7 +76,7 @@ export default function DriverPairingScreen({ navigation }) {
           : <Text style={styles.btnText}>Dołącz</Text>
         }
       </TouchableOpacity>
-    </View>
+    </KeyboardAvoidingView>
   );
 }
 

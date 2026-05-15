@@ -16,6 +16,7 @@ export default function DriverMapScreen({ route }) {
   const mapRef = useRef(null);
   const locationSubRef = useRef(null);
   const lastSentRef = useRef(0);
+  const lastPositionRef = useRef(null);  // driver's own GPS — used as route origin
   const routeCoordsRef = useRef([]);
 
   const [connected, setConnected] = useState(true);
@@ -23,23 +24,32 @@ export default function DriverMapScreen({ route }) {
   const [currentStep, setCurrentStep] = useState(null);
   const [overview, setOverview] = useState(false);
 
-  // GPS tracking — send position to navigator
+  // GPS tracking — show own position on map + send to navigator
   useEffect(() => {
     let active = true;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted' || !active) return;
+      if (status !== 'granted') {
+        console.warn('[GPS] Permission denied');
+        return;
+      }
+      if (!active) return;
 
       locationSubRef.current = await Location.watchPositionAsync(
         { accuracy: Location.Accuracy.High, timeInterval: POSITION_INTERVAL_MS, distanceInterval: 5 },
         (loc) => {
+          if (!active) return;
+          const { latitude, longitude } = loc.coords;
+
+          // Show on driver's own map (bug #1 fix)
+          mapRef.current?.updateDriver(latitude, longitude);
+          lastPositionRef.current = { lat: latitude, lng: longitude };
+
+          // Throttle send to navigator
           const now = Date.now();
           if (now - lastSentRef.current < POSITION_INTERVAL_MS) return;
           lastSentRef.current = now;
-          socket?.emit('send_position', {
-            lat: loc.coords.latitude,
-            lng: loc.coords.longitude,
-          });
+          socket?.emit('send_position', { lat: latitude, lng: longitude });
         },
       );
     })();
@@ -58,14 +68,23 @@ export default function DriverMapScreen({ route }) {
 
     const onRouteUpdate = async (payload) => {
       const { waypoints: wps } = payload;
+      console.log('[DriverMap] route_update, waypoints:', wps?.length ?? 0);
       if (!wps?.length) return;
 
       setStatusMsg('Wyznaczam trasę…');
       mapRef.current?.updateWaypoints(wps);
 
-      const result = await fetchRoute(wps);
+      // Prepend driver's GPS as route origin (bug #2 fix)
+      const origin = lastPositionRef.current;
+      const routePoints = origin ? [origin, ...wps] : wps;
+      console.log('[DriverMap] fetchRoute with', routePoints.length, 'points, origin:', !!origin);
+
+      const result = await fetchRoute(routePoints);
       if (!result) {
-        setStatusMsg('Nie udało się wyznaczyć trasy.');
+        console.warn('[DriverMap] fetchRoute returned null — need ≥2 points or OSRM error');
+        setStatusMsg(origin
+          ? 'Nie udało się wyznaczyć trasy — sprawdź połączenie.'
+          : 'Oczekuję na sygnał GPS przed wyznaczeniem trasy…');
         return;
       }
 

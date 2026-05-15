@@ -1,9 +1,9 @@
-import React, { useRef, forwardRef, useImperativeHandle } from 'react';
+import React, { useRef, forwardRef, useImperativeHandle, useCallback } from 'react';
 import { View, StyleSheet } from 'react-native';
 import WebView from 'react-native-webview';
 
-// Leaflet map via WebView — no Google Maps API key needed
-// Exposes: updateDriver(lat, lng), updateWaypoints(wps), updateRoute(coords), fitRoute(coords)
+// Calls Leaflet functions directly via injectJavaScript — more reliable than dispatchEvent
+// Messages are queued until the WebView signals 'ready' (Leaflet CDN loaded + map initialized)
 
 const MAP_HTML = `<!DOCTYPE html>
 <html>
@@ -53,6 +53,7 @@ const MAP_HTML = `<!DOCTYPE html>
         if(wp.label) m.bindPopup(wp.label);
         waypointMarkers.push(m);
       });
+      if(wps.length>0) map.setView([wps[0].lat,wps[0].lng],13,{animate:true});
     }
 
     function updateRoute(coords){
@@ -72,37 +73,53 @@ const MAP_HTML = `<!DOCTYPE html>
       map.setView([lat,lng],zoom||map.getZoom(),{animate:true});
     }
 
-    window.addEventListener('message',function(e){
-      try{
-        var msg=JSON.parse(e.data);
-        if(msg.t==='driver') updateDriver(msg.lat,msg.lng);
-        else if(msg.t==='waypoints') updateWaypoints(msg.wps);
-        else if(msg.t==='route') updateRoute(msg.coords);
-        else if(msg.t==='fit') fitRoute(msg.coords);
-        else if(msg.t==='pan') panTo(msg.lat,msg.lng,msg.zoom);
-      }catch(err){}
-    });
+    // Signal React Native that Leaflet is ready
+    if(window.ReactNativeWebView){
+      window.ReactNativeWebView.postMessage('ready');
+    }
   </script>
 </body>
 </html>`;
 
 const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
   const webViewRef = useRef(null);
+  const readyRef = useRef(false);
+  const queueRef = useRef([]);
 
-  function send(obj) {
-    const js = `(function(){
-      window.dispatchEvent(new MessageEvent('message',{data:${JSON.stringify(JSON.stringify(obj))}}));
-    })(); true;`;
-    webViewRef.current?.injectJavaScript(js);
-  }
+  const exec = useCallback((jsCode) => {
+    const full = jsCode + '; true;';
+    if (readyRef.current) {
+      webViewRef.current?.injectJavaScript(full);
+    } else {
+      queueRef.current.push(full);
+    }
+  }, []);
+
+  const onMessage = useCallback((event) => {
+    if (event.nativeEvent.data === 'ready') {
+      readyRef.current = true;
+      const pending = queueRef.current.splice(0);
+      pending.forEach((js) => webViewRef.current?.injectJavaScript(js));
+    }
+  }, []);
 
   useImperativeHandle(ref, () => ({
-    updateDriver(lat, lng) { send({ t: 'driver', lat, lng }); },
-    updateWaypoints(wps) { send({ t: 'waypoints', wps }); },
-    updateRoute(coords) { send({ t: 'route', coords }); },
-    fitRoute(coords) { send({ t: 'fit', coords }); },
-    panTo(lat, lng, zoom) { send({ t: 'pan', lat, lng, zoom }); },
-  }));
+    updateDriver(lat, lng) {
+      exec(`updateDriver(${lat},${lng})`);
+    },
+    updateWaypoints(wps) {
+      exec(`updateWaypoints(${JSON.stringify(wps)})`);
+    },
+    updateRoute(coords) {
+      exec(`updateRoute(${JSON.stringify(coords)})`);
+    },
+    fitRoute(coords) {
+      exec(`fitRoute(${JSON.stringify(coords)})`);
+    },
+    panTo(lat, lng, zoom) {
+      exec(`panTo(${lat},${lng},${zoom != null ? zoom : 'undefined'})`);
+    },
+  }), [exec]);
 
   return (
     <View style={[styles.container, style]}>
@@ -114,6 +131,7 @@ const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
         originWhitelist={['*']}
         scrollEnabled={false}
         bounces={false}
+        onMessage={onMessage}
       />
     </View>
   );
