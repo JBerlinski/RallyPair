@@ -5,6 +5,7 @@ import {
 } from 'react-native';
 import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
+import { socketStore } from '../socketStore';
 
 export default function DriverPairingScreen({ navigation }) {
   const [code, setCode] = useState('');
@@ -25,8 +26,10 @@ export default function DriverPairingScreen({ navigation }) {
     socket.on('connect', () => {
       socket.emit('join_room', { roomCode: trimmed }, (res) => {
         if (res.ok) {
+          socketStore.setDriver(socket);
           setLoading(false);
-          navigation.replace('DriverMap', { roomCode: trimmed, socket });
+          // Pass only serializable primitives — socket lives in socketStore
+          navigation.replace('DriverMap', { roomCode: trimmed });
         } else {
           socket.disconnect();
           setLoading(false);

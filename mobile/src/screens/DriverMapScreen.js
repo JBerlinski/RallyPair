@@ -4,13 +4,19 @@ import {
 } from 'react-native';
 import MapView, { Polyline, Marker, UrlTile, PROVIDER_DEFAULT } from 'react-native-maps';
 import * as Haptics from 'expo-haptics';
+import * as Location from 'expo-location';
+import { socketStore } from '../socketStore';
 import { fetchRoute } from '../utils/osrm';
 
 const INITIAL_REGION = { latitude: 52.237, longitude: 21.017, latitudeDelta: 0.05, longitudeDelta: 0.05 };
+const POSITION_INTERVAL_MS = 3000;
 
-export default function DriverMapScreen({ route, navigation }) {
-  const { roomCode, socket } = route.params;
+export default function DriverMapScreen({ route }) {
+  const { roomCode } = route.params;
+  const socket = socketStore.getDriver();
   const mapRef = useRef(null);
+  const locationSubRef = useRef(null);
+  const lastSentRef = useRef(0);
 
   const [routeCoords, setRouteCoords] = useState([]);
   const [waypoints, setWaypoints] = useState([]);
@@ -27,17 +33,50 @@ export default function DriverMapScreen({ route, navigation }) {
     });
   }, []);
 
+  // GPS tracking — sends position to navigator via WebSocket
   useEffect(() => {
-    if (!socket) return;
+    let active = true;
 
-    socket.on('route_update', async (payload) => {
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted' || !active) return;
+
+      locationSubRef.current = await Location.watchPositionAsync(
+        { accuracy: Location.Accuracy.High, timeInterval: POSITION_INTERVAL_MS, distanceInterval: 5 },
+        (loc) => {
+          const now = Date.now();
+          if (now - lastSentRef.current < POSITION_INTERVAL_MS) return;
+          lastSentRef.current = now;
+          socket?.emit('send_position', {
+            lat: loc.coords.latitude,
+            lng: loc.coords.longitude,
+            heading: loc.coords.heading,
+            speed: loc.coords.speed,
+          });
+        },
+      );
+    })();
+
+    return () => {
+      active = false;
+      locationSubRef.current?.remove();
+    };
+  }, [socket]);
+
+  // WebSocket event listeners
+  useEffect(() => {
+    if (!socket) {
+      setStatusMsg('Brak połączenia z serwerem.');
+      return;
+    }
+
+    const onRouteUpdate = async (payload) => {
       const { waypoints: wps } = payload;
       if (!wps || wps.length === 0) return;
 
       setWaypoints(wps);
       setStatusMsg('Wyznaczam trasę…');
 
-      // Always route from first waypoint; for real use you'd prepend current GPS
       const result = await fetchRoute(wps);
       if (!result) {
         setStatusMsg('Nie udało się wyznaczyć trasy.');
@@ -48,27 +87,31 @@ export default function DriverMapScreen({ route, navigation }) {
       setSteps(result.steps);
       setStatusMsg('');
 
-      // Alert driver
       try {
         await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
       } catch {}
 
       Alert.alert('Nowa trasa', `Cel: ${wps[wps.length - 1].label || 'zaktualizowany'}`);
-
       setTimeout(() => fitToRoute(result.coordinates), 300);
-    });
+    };
 
-    socket.on('room_closed', () => {
+    const onRoomClosed = () => {
       setConnected(false);
       Alert.alert('Rozłączono', 'Nawigator zakończył sesję.');
-    });
+    };
 
+    socket.on('route_update', onRouteUpdate);
+    socket.on('room_closed', onRoomClosed);
     socket.on('disconnect', () => setConnected(false));
     socket.on('connect', () => setConnected(true));
 
     return () => {
-      socket.off('route_update');
-      socket.off('room_closed');
+      socket.off('route_update', onRouteUpdate);
+      socket.off('room_closed', onRoomClosed);
+      socket.off('disconnect');
+      socket.off('connect');
+      socket.disconnect();
+      socketStore.clearDriver();
     };
   }, [socket, fitToRoute]);
 
@@ -96,6 +139,8 @@ export default function DriverMapScreen({ route, navigation }) {
         pitchEnabled={false}
         toolbarEnabled={false}
         moveOnMarkerPress={false}
+        showsUserLocation
+        showsMyLocationButton={false}
       >
         <UrlTile
           urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -121,13 +166,11 @@ export default function DriverMapScreen({ route, navigation }) {
         ))}
       </MapView>
 
-      {/* Status bar top */}
       <View style={styles.topBar}>
         <Text style={styles.roomCode}>Pokój: {roomCode}</Text>
         <View style={[styles.dot, connected ? styles.dotGreen : styles.dotRed]} />
       </View>
 
-      {/* Current instruction */}
       {currentInstruction && !overview && (
         <View style={styles.instructionBox}>
           <Text style={styles.instructionText}>
@@ -142,14 +185,12 @@ export default function DriverMapScreen({ route, navigation }) {
         </View>
       )}
 
-      {/* Status message */}
       {statusMsg !== '' && (
         <View style={styles.statusBox}>
           <Text style={styles.statusText}>{statusMsg}</Text>
         </View>
       )}
 
-      {/* Overview button */}
       <TouchableOpacity style={styles.overviewBtn} onPress={handleOverviewToggle}>
         <Text style={styles.overviewBtnText}>{overview ? '📍 Nawigacja' : '🗺 Cała mapa'}</Text>
       </TouchableOpacity>

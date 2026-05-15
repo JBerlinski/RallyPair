@@ -4,14 +4,19 @@ import {
   StyleSheet, ActivityIndicator, Alert, KeyboardAvoidingView,
   Platform, StatusBar,
 } from 'react-native';
+import MapView, { Marker, Polyline, UrlTile, PROVIDER_DEFAULT } from 'react-native-maps';
 import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
+import { socketStore } from '../socketStore';
 import { parseLocation } from '../utils/parseLocation';
 
 const STATUS = { CONNECTING: 'connecting', WAITING: 'waiting', PAIRED: 'paired' };
+const WARSAW = { latitude: 52.237, longitude: 21.017, latitudeDelta: 0.1, longitudeDelta: 0.1 };
 
 export default function NavigatorScreen({ navigation }) {
   const socketRef = useRef(null);
+  const mapRef = useRef(null);
+
   const [status, setStatus] = useState(STATUS.CONNECTING);
   const [roomCode, setRoomCode] = useState('');
   const [locationInput, setLocationInput] = useState('');
@@ -19,6 +24,7 @@ export default function NavigatorScreen({ navigation }) {
   const [parsing, setParsing] = useState(false);
   const [sending, setSending] = useState(false);
   const [driverConnected, setDriverConnected] = useState(false);
+  const [driverPosition, setDriverPosition] = useState(null);
 
   useEffect(() => {
     const socket = io(BACKEND_URL, { transports: ['websocket'] });
@@ -27,6 +33,7 @@ export default function NavigatorScreen({ navigation }) {
     socket.on('connect', () => {
       socket.emit('create_room', (res) => {
         if (res.ok) {
+          socketStore.setNavigator(socket);
           setRoomCode(res.roomCode);
           setStatus(STATUS.WAITING);
         } else {
@@ -43,7 +50,13 @@ export default function NavigatorScreen({ navigation }) {
 
     socket.on('driver_disconnected', () => {
       setDriverConnected(false);
+      setDriverPosition(null);
       setStatus(STATUS.WAITING);
+    });
+
+    socket.on('position_update', (payload) => {
+      if (payload?.lat == null || payload?.lng == null) return;
+      setDriverPosition({ latitude: payload.lat, longitude: payload.lng });
     });
 
     socket.on('connect_error', () => {
@@ -51,8 +64,24 @@ export default function NavigatorScreen({ navigation }) {
       navigation.goBack();
     });
 
-    return () => socket.disconnect();
+    return () => {
+      socket.disconnect();
+      socketStore.clearNavigator();
+    };
   }, []);
+
+  // Pan map to driver when position arrives for the first time
+  const prevDriverPos = useRef(null);
+  useEffect(() => {
+    if (!driverPosition || !mapRef.current) return;
+    if (!prevDriverPos.current) {
+      mapRef.current.animateToRegion(
+        { ...driverPosition, latitudeDelta: 0.05, longitudeDelta: 0.05 },
+        600,
+      );
+    }
+    prevDriverPos.current = driverPosition;
+  }, [driverPosition]);
 
   const handleAddWaypoint = useCallback(async () => {
     if (!locationInput.trim()) return;
@@ -96,6 +125,11 @@ export default function NavigatorScreen({ navigation }) {
     );
   }
 
+  const mapMarkers = [
+    ...(driverPosition ? [{ latitude: driverPosition.latitude, longitude: driverPosition.longitude, isDriver: true }] : []),
+    ...waypoints.map((wp) => ({ latitude: wp.lat, longitude: wp.lng, label: wp.label })),
+  ];
+
   return (
     <KeyboardAvoidingView
       style={styles.container}
@@ -103,91 +137,133 @@ export default function NavigatorScreen({ navigation }) {
     >
       <StatusBar barStyle="light-content" />
 
-      {/* Room code */}
-      <View style={styles.codeBox}>
-        <Text style={styles.codeLabel}>Kod pokoju</Text>
-        <Text style={styles.codeText}>{roomCode}</Text>
-        <Text style={styles.codeHint}>
-          {status === STATUS.WAITING
-            ? 'Czekam na kierowcę…'
-            : '✅ Kierowca połączony'}
-        </Text>
-      </View>
+      {/* ── Upper section ── */}
+      <View style={styles.upper}>
+        <View style={styles.codeBox}>
+          <Text style={styles.codeLabel}>Kod pokoju</Text>
+          <Text style={styles.codeText}>{roomCode}</Text>
+          <Text style={styles.codeHint}>
+            {status === STATUS.WAITING ? 'Czekam na kierowcę…' : '✅ Kierowca połączony'}
+          </Text>
+        </View>
 
-      {/* Location input */}
-      <View style={styles.inputRow}>
-        <TextInput
-          style={styles.input}
-          placeholder="Adres, koordynaty lub link Google Maps"
-          placeholderTextColor="#64748b"
-          value={locationInput}
-          onChangeText={setLocationInput}
-          onSubmitEditing={handleAddWaypoint}
-          returnKeyType="done"
-          multiline={false}
+        <View style={styles.inputRow}>
+          <TextInput
+            style={styles.input}
+            placeholder="Adres, koordynaty lub link Google Maps"
+            placeholderTextColor="#64748b"
+            value={locationInput}
+            onChangeText={setLocationInput}
+            onSubmitEditing={handleAddWaypoint}
+            returnKeyType="done"
+            multiline={false}
+          />
+          <TouchableOpacity style={styles.addBtn} onPress={handleAddWaypoint} disabled={parsing}>
+            {parsing
+              ? <ActivityIndicator size="small" color="#fff" />
+              : <Text style={styles.addBtnText}>+</Text>}
+          </TouchableOpacity>
+        </View>
+
+        <FlatList
+          data={waypoints}
+          keyExtractor={(_, i) => i.toString()}
+          style={styles.list}
+          keyboardShouldPersistTaps="handled"
+          renderItem={({ item, index }) => (
+            <View style={styles.waypointRow}>
+              <Text style={styles.waypointIndex}>{index + 1}</Text>
+              <Text style={styles.waypointLabel} numberOfLines={2}>{item.label}</Text>
+              <TouchableOpacity onPress={() => handleRemoveWaypoint(index)} style={styles.removeBtn}>
+                <Text style={styles.removeBtnText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          ListEmptyComponent={
+            <Text style={styles.emptyText}>Brak punktów — dodaj cel lub przystanek</Text>
+          }
         />
-        <TouchableOpacity style={styles.addBtn} onPress={handleAddWaypoint} disabled={parsing}>
-          {parsing ? <ActivityIndicator size="small" color="#fff" /> : <Text style={styles.addBtnText}>+</Text>}
+
+        <TouchableOpacity
+          style={[styles.sendBtn, (!driverConnected || waypoints.length === 0) && styles.sendBtnDisabled]}
+          onPress={handleSendRoute}
+          disabled={!driverConnected || waypoints.length === 0 || sending}
+        >
+          {sending
+            ? <ActivityIndicator size="small" color="#fff" />
+            : <Text style={styles.sendBtnText}>
+                {driverConnected ? 'Wyślij trasę do kierowcy' : 'Czekam na kierowcę…'}
+              </Text>}
         </TouchableOpacity>
       </View>
 
-      {/* Waypoints list */}
-      <FlatList
-        data={waypoints}
-        keyExtractor={(_, i) => i.toString()}
-        style={styles.list}
-        renderItem={({ item, index }) => (
-          <View style={styles.waypointRow}>
-            <Text style={styles.waypointIndex}>{index + 1}</Text>
-            <Text style={styles.waypointLabel} numberOfLines={2}>{item.label}</Text>
-            <TouchableOpacity onPress={() => handleRemoveWaypoint(index)} style={styles.removeBtn}>
-              <Text style={styles.removeBtnText}>✕</Text>
-            </TouchableOpacity>
+      {/* ── Map section ── */}
+      <View style={styles.mapContainer}>
+        {!driverConnected && (
+          <View style={styles.mapOverlay} pointerEvents="none">
+            <Text style={styles.mapOverlayText}>Mapa aktywna po dołączeniu kierowcy</Text>
           </View>
         )}
-        ListEmptyComponent={
-          <Text style={styles.emptyText}>Brak punktów — dodaj cel lub przystanek</Text>
-        }
-      />
+        <MapView
+          ref={mapRef}
+          style={StyleSheet.absoluteFill}
+          provider={PROVIDER_DEFAULT}
+          initialRegion={WARSAW}
+          scrollEnabled={false}
+          zoomEnabled={false}
+          rotateEnabled={false}
+          pitchEnabled={false}
+          toolbarEnabled={false}
+        >
+          <UrlTile
+            urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+            maximumZ={19}
+            flipY={false}
+          />
 
-      {/* Send button */}
-      <TouchableOpacity
-        style={[styles.sendBtn, (!driverConnected || waypoints.length === 0) && styles.sendBtnDisabled]}
-        onPress={handleSendRoute}
-        disabled={!driverConnected || waypoints.length === 0 || sending}
-      >
-        {sending
-          ? <ActivityIndicator size="small" color="#fff" />
-          : <Text style={styles.sendBtnText}>
-              {driverConnected ? 'Wyślij trasę do kierowcy' : 'Czekam na kierowcę…'}
-            </Text>
-        }
-      </TouchableOpacity>
+          {driverPosition && (
+            <Marker
+              coordinate={driverPosition}
+              title="Kierowca"
+              anchor={{ x: 0.5, y: 0.5 }}
+            >
+              <View style={styles.driverDot} />
+            </Marker>
+          )}
+
+          {waypoints.map((wp, i) => (
+            <Marker
+              key={i}
+              coordinate={{ latitude: wp.lat, longitude: wp.lng }}
+              title={wp.label || `Punkt ${i + 1}`}
+              pinColor={i === waypoints.length - 1 ? '#ef4444' : '#f59e0b'}
+            />
+          ))}
+        </MapView>
+      </View>
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0f172a', padding: 16 },
+  container: { flex: 1, backgroundColor: '#0f172a' },
   centered: { flex: 1, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center' },
   statusText: { color: '#94a3b8', marginTop: 12, fontSize: 15 },
 
-  codeBox: {
-    backgroundColor: '#1e293b',
-    borderRadius: 12,
-    padding: 16,
-    alignItems: 'center',
-    marginBottom: 16,
-    marginTop: 8,
-  },
-  codeLabel: { color: '#94a3b8', fontSize: 12, marginBottom: 4 },
-  codeText: { color: '#f1f5f9', fontSize: 48, fontWeight: '800', letterSpacing: 8 },
-  codeHint: { color: '#64748b', fontSize: 13, marginTop: 6 },
+  upper: { flex: 1, padding: 16 },
 
-  inputRow: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  codeBox: {
+    backgroundColor: '#1e293b', borderRadius: 12, padding: 12,
+    alignItems: 'center', marginBottom: 12, marginTop: 4,
+  },
+  codeLabel: { color: '#94a3b8', fontSize: 11, marginBottom: 2 },
+  codeText: { color: '#f1f5f9', fontSize: 40, fontWeight: '800', letterSpacing: 8 },
+  codeHint: { color: '#64748b', fontSize: 12, marginTop: 4 },
+
+  inputRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
   input: {
     flex: 1, backgroundColor: '#1e293b', borderRadius: 10,
-    color: '#f1f5f9', paddingHorizontal: 14, paddingVertical: 12, fontSize: 14,
+    color: '#f1f5f9', paddingHorizontal: 14, paddingVertical: 11, fontSize: 14,
   },
   addBtn: {
     backgroundColor: '#2563eb', borderRadius: 10,
@@ -199,21 +275,36 @@ const styles = StyleSheet.create({
   waypointRow: {
     flexDirection: 'row', alignItems: 'center',
     backgroundColor: '#1e293b', borderRadius: 10,
-    padding: 12, marginBottom: 8,
+    padding: 10, marginBottom: 6,
   },
   waypointIndex: {
-    color: '#3b82f6', fontWeight: '700', fontSize: 16,
-    width: 24, textAlign: 'center', marginRight: 10,
+    color: '#3b82f6', fontWeight: '700', fontSize: 15,
+    width: 22, textAlign: 'center', marginRight: 8,
   },
   waypointLabel: { flex: 1, color: '#e2e8f0', fontSize: 13 },
   removeBtn: { padding: 6 },
-  removeBtnText: { color: '#ef4444', fontSize: 16 },
-  emptyText: { color: '#334155', textAlign: 'center', marginTop: 24, fontSize: 14 },
+  removeBtnText: { color: '#ef4444', fontSize: 15 },
+  emptyText: { color: '#334155', textAlign: 'center', marginTop: 16, fontSize: 13 },
 
   sendBtn: {
     backgroundColor: '#059669', borderRadius: 12,
-    padding: 16, alignItems: 'center', marginTop: 8,
+    padding: 14, alignItems: 'center', marginTop: 6,
   },
   sendBtnDisabled: { backgroundColor: '#1e293b' },
-  sendBtnText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
+
+  mapContainer: { height: 220, overflow: 'hidden' },
+  mapOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 10,
+    backgroundColor: 'rgba(15,23,42,0.75)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  mapOverlayText: { color: '#475569', fontSize: 13 },
+
+  driverDot: {
+    width: 16, height: 16, borderRadius: 8,
+    backgroundColor: '#3b82f6',
+    borderWidth: 2, borderColor: '#fff',
+  },
 });
