@@ -12,6 +12,7 @@ import { fetchRoute } from '../utils/osrm';
 import { loadSettings, getCachedSettings, TILE_PROVIDERS } from '../utils/settings';
 
 const POSITION_INTERVAL_MS = 3000;
+const NAV_ZOOM = 17;
 
 function haversine(lat1, lng1, lat2, lng2) {
   const R = 6371000;
@@ -68,6 +69,8 @@ function fmtDist(m) {
   return `${Math.round(m / 10) * 10} m`;
 }
 
+// navMode: null = no route, 'follow' = nav view (zoom+heading), 'overview' = full route
+
 export default function DriverMapScreen({ navigation, route }) {
   const { roomCode } = route.params;
   const socket = socketStore.getDriver();
@@ -75,6 +78,7 @@ export default function DriverMapScreen({ navigation, route }) {
   const locationSubRef = useRef(null);
   const lastSentRef = useRef(0);
   const lastPositionRef = useRef(null);
+  const currentHeadingRef = useRef(null);
   const routeCoordsRef = useRef([]);
   const stepsRef = useRef([]);
   const stepIdxRef = useRef(0);
@@ -86,8 +90,9 @@ export default function DriverMapScreen({ navigation, route }) {
   const [statusMsg, setStatusMsg] = useState('Czekam na trasę od nawigatora…');
   const [currentStep, setCurrentStep] = useState(null);
   const [distToStep, setDistToStep] = useState(null);
+  const [navMode, setNavMode] = useState(null); // null | 'follow' | 'overview'
 
-  // Load settings on every focus (picks up changes made in Settings screen)
+  // Apply tile and settings on every focus
   useFocusEffect(useCallback(() => {
     loadSettings().then((s) => {
       settingsRef.current = s;
@@ -112,12 +117,22 @@ export default function DriverMapScreen({ navigation, route }) {
           const hdg = (heading != null && heading >= 0) ? heading : null;
 
           mapRef.current?.updateDriver(latitude, longitude, hdg);
-
-          const cfg = settingsRef.current;
-          if (cfg.compassRotation && hdg != null) mapRef.current?.setBearing(hdg);
-          if (cfg.autoCenter) mapRef.current?.panTo(latitude, longitude);
-
+          currentHeadingRef.current = hdg;
           lastPositionRef.current = { lat: latitude, lng: longitude };
+
+          // In follow mode: always track driver + rotate map by heading
+          // In other modes: respect user settings
+          setNavMode((mode) => {
+            if (mode === 'follow') {
+              mapRef.current?.panTo(latitude, longitude, NAV_ZOOM);
+              if (hdg != null) mapRef.current?.setBearing(hdg);
+            } else {
+              const cfg = settingsRef.current;
+              if (cfg.autoCenter) mapRef.current?.panTo(latitude, longitude);
+              if (cfg.compassRotation && hdg != null) mapRef.current?.setBearing(hdg);
+            }
+            return mode; // no state change — read-only use
+          });
 
           // Advance route steps
           const steps = stepsRef.current;
@@ -180,7 +195,18 @@ export default function DriverMapScreen({ navigation, route }) {
       setDistToStep(null);
       setStatusMsg('');
       mapRef.current?.updateRoute(result.coordinates);
-      mapRef.current?.fitRoute(result.coordinates);
+
+      // Enter navigation view: zoom to driver at street level, orient by heading
+      if (origin) {
+        mapRef.current?.panTo(origin.lat, origin.lng, NAV_ZOOM);
+        if (currentHeadingRef.current != null) {
+          mapRef.current?.setBearing(currentHeadingRef.current);
+        }
+      } else {
+        // No GPS yet — fall back to showing full route
+        mapRef.current?.fitRoute(result.coordinates);
+      }
+      setNavMode('follow');
 
       try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); } catch {}
       Alert.alert('Nowa trasa', `Cel: ${wps[wps.length - 1].label || 'zaktualizowany'}`);
@@ -244,11 +270,28 @@ export default function DriverMapScreen({ navigation, route }) {
     };
   }, [socket, roomCode]);
 
-  const handleCenter = useCallback(() => {
-    if (lastPositionRef.current) {
-      const { lat, lng } = lastPositionRef.current;
-      mapRef.current?.panTo(lat, lng, 16);
-    }
+  // Toggle between full-route overview and navigation follow view
+  const handleNavToggle = useCallback(() => {
+    setNavMode((prev) => {
+      if (prev === 'overview') {
+        // Return to navigation: zoom to driver + restore heading
+        const pos = lastPositionRef.current;
+        if (pos) {
+          mapRef.current?.panTo(pos.lat, pos.lng, NAV_ZOOM);
+          if (currentHeadingRef.current != null) {
+            mapRef.current?.setBearing(currentHeadingRef.current);
+          }
+        }
+        return 'follow';
+      } else {
+        // Show full route overview, reset bearing to north-up
+        if (routeCoordsRef.current.length > 0) {
+          mapRef.current?.fitRoute(routeCoordsRef.current);
+          mapRef.current?.setBearing(0);
+        }
+        return 'overview';
+      }
+    });
   }, []);
 
   const handleSettings = useCallback(() => navigation.navigate('Settings'), [navigation]);
@@ -260,7 +303,7 @@ export default function DriverMapScreen({ navigation, route }) {
       <StatusBar hidden />
       <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} />
 
-      {/* Maneuver island — top, full width */}
+      {/* Maneuver island — top */}
       {currentStep && !reconnecting && (
         <View style={styles.maneuverIsland}>
           <Text style={styles.maneuverIcon}>
@@ -304,11 +347,17 @@ export default function DriverMapScreen({ navigation, route }) {
         <Text style={styles.roomCode}>{roomCode}</Text>
       </View>
 
-      {/* FABs — bottom-right column */}
+      {/* FABs — bottom-right */}
       <View style={styles.fabCol}>
-        <TouchableOpacity style={styles.fab} onPress={handleCenter}>
-          <Text style={styles.fabIcon}>⊙</Text>
-        </TouchableOpacity>
+        {/* Nav toggle — only visible when a route is loaded */}
+        {navMode != null && (
+          <TouchableOpacity
+            style={[styles.fab, navMode === 'overview' && styles.fabActive]}
+            onPress={handleNavToggle}
+          >
+            <Text style={styles.fabIcon}>{navMode === 'overview' ? '📍' : '🗺'}</Text>
+          </TouchableOpacity>
+        )}
         <TouchableOpacity style={styles.fab} onPress={handleSettings}>
           <Text style={styles.fabIcon}>⚙</Text>
         </TouchableOpacity>
@@ -365,5 +414,6 @@ const styles = StyleSheet.create({
     shadowColor: '#000', shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.4, shadowRadius: 4, elevation: 6,
   },
+  fabActive: { backgroundColor: 'rgba(37,99,235,0.9)' },
   fabIcon: { fontSize: 22, color: '#f1f5f9' },
 });
