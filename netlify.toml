@@ -2,7 +2,6 @@
   base    = "mobile"
   command = "npx expo export --platform web"
   publish = "dist"
-
 [build.environment]
   NODE_VERSION   = "20"
   NPM_FLAGS      = "--legacy-peer-deps"
