@@ -4,18 +4,18 @@ import {
   StyleSheet, ActivityIndicator, Alert, KeyboardAvoidingView,
   Platform, StatusBar,
 } from 'react-native';
-import MapView, { Marker, Polyline, UrlTile, PROVIDER_DEFAULT } from 'react-native-maps';
 import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
 import { socketStore } from '../socketStore';
 import { parseLocation } from '../utils/parseLocation';
+import LeafletMap from '../components/LeafletMap';
 
 const STATUS = { CONNECTING: 'connecting', WAITING: 'waiting', PAIRED: 'paired' };
-const WARSAW = { latitude: 52.237, longitude: 21.017, latitudeDelta: 0.1, longitudeDelta: 0.1 };
 
 export default function NavigatorScreen({ navigation }) {
   const socketRef = useRef(null);
   const mapRef = useRef(null);
+  const firstDriverPos = useRef(false);
 
   const [status, setStatus] = useState(STATUS.CONNECTING);
   const [roomCode, setRoomCode] = useState('');
@@ -24,7 +24,6 @@ export default function NavigatorScreen({ navigation }) {
   const [parsing, setParsing] = useState(false);
   const [sending, setSending] = useState(false);
   const [driverConnected, setDriverConnected] = useState(false);
-  const [driverPosition, setDriverPosition] = useState(null);
 
   useEffect(() => {
     const socket = io(BACKEND_URL, { transports: ['websocket'] });
@@ -46,17 +45,22 @@ export default function NavigatorScreen({ navigation }) {
     socket.on('driver_joined', () => {
       setDriverConnected(true);
       setStatus(STATUS.PAIRED);
+      firstDriverPos.current = false;
     });
 
     socket.on('driver_disconnected', () => {
       setDriverConnected(false);
-      setDriverPosition(null);
+      firstDriverPos.current = false;
       setStatus(STATUS.WAITING);
     });
 
     socket.on('position_update', (payload) => {
       if (payload?.lat == null || payload?.lng == null) return;
-      setDriverPosition({ latitude: payload.lat, longitude: payload.lng });
+      mapRef.current?.updateDriver(payload.lat, payload.lng);
+      if (!firstDriverPos.current) {
+        mapRef.current?.panTo(payload.lat, payload.lng, 14);
+        firstDriverPos.current = true;
+      }
     });
 
     socket.on('connect_error', () => {
@@ -70,19 +74,6 @@ export default function NavigatorScreen({ navigation }) {
     };
   }, []);
 
-  // Pan map to driver when position arrives for the first time
-  const prevDriverPos = useRef(null);
-  useEffect(() => {
-    if (!driverPosition || !mapRef.current) return;
-    if (!prevDriverPos.current) {
-      mapRef.current.animateToRegion(
-        { ...driverPosition, latitudeDelta: 0.05, longitudeDelta: 0.05 },
-        600,
-      );
-    }
-    prevDriverPos.current = driverPosition;
-  }, [driverPosition]);
-
   const handleAddWaypoint = useCallback(async () => {
     if (!locationInput.trim()) return;
     setParsing(true);
@@ -93,7 +84,12 @@ export default function NavigatorScreen({ navigation }) {
         return;
       }
       const label = coords.displayName || locationInput.trim();
-      setWaypoints((prev) => [...prev, { ...coords, label }]);
+      const newWp = { ...coords, label };
+      setWaypoints((prev) => {
+        const updated = [...prev, newWp];
+        mapRef.current?.updateWaypoints(updated);
+        return updated;
+      });
       setLocationInput('');
     } catch {
       Alert.alert('Błąd', 'Wystąpił błąd podczas parsowania lokalizacji.');
@@ -103,7 +99,11 @@ export default function NavigatorScreen({ navigation }) {
   }, [locationInput]);
 
   const handleRemoveWaypoint = (index) => {
-    setWaypoints((prev) => prev.filter((_, i) => i !== index));
+    setWaypoints((prev) => {
+      const updated = prev.filter((_, i) => i !== index);
+      mapRef.current?.updateWaypoints(updated);
+      return updated;
+    });
   };
 
   const handleSendRoute = useCallback(() => {
@@ -125,11 +125,6 @@ export default function NavigatorScreen({ navigation }) {
     );
   }
 
-  const mapMarkers = [
-    ...(driverPosition ? [{ latitude: driverPosition.latitude, longitude: driverPosition.longitude, isDriver: true }] : []),
-    ...waypoints.map((wp) => ({ latitude: wp.lat, longitude: wp.lng, label: wp.label })),
-  ];
-
   return (
     <KeyboardAvoidingView
       style={styles.container}
@@ -137,7 +132,7 @@ export default function NavigatorScreen({ navigation }) {
     >
       <StatusBar barStyle="light-content" />
 
-      {/* ── Upper section ── */}
+      {/* Upper section */}
       <View style={styles.upper}>
         <View style={styles.codeBox}>
           <Text style={styles.codeLabel}>Kod pokoju</Text>
@@ -197,49 +192,14 @@ export default function NavigatorScreen({ navigation }) {
         </TouchableOpacity>
       </View>
 
-      {/* ── Map section ── */}
+      {/* Map section */}
       <View style={styles.mapContainer}>
         {!driverConnected && (
           <View style={styles.mapOverlay} pointerEvents="none">
             <Text style={styles.mapOverlayText}>Mapa aktywna po dołączeniu kierowcy</Text>
           </View>
         )}
-        <MapView
-          ref={mapRef}
-          style={StyleSheet.absoluteFill}
-          provider={PROVIDER_DEFAULT}
-          initialRegion={WARSAW}
-          scrollEnabled={false}
-          zoomEnabled={false}
-          rotateEnabled={false}
-          pitchEnabled={false}
-          toolbarEnabled={false}
-        >
-          <UrlTile
-            urlTemplate="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-            maximumZ={19}
-            flipY={false}
-          />
-
-          {driverPosition && (
-            <Marker
-              coordinate={driverPosition}
-              title="Kierowca"
-              anchor={{ x: 0.5, y: 0.5 }}
-            >
-              <View style={styles.driverDot} />
-            </Marker>
-          )}
-
-          {waypoints.map((wp, i) => (
-            <Marker
-              key={i}
-              coordinate={{ latitude: wp.lat, longitude: wp.lng }}
-              title={wp.label || `Punkt ${i + 1}`}
-              pinColor={i === waypoints.length - 1 ? '#ef4444' : '#f59e0b'}
-            />
-          ))}
-        </MapView>
+        <LeafletMap ref={mapRef} style={styles.map} />
       </View>
     </KeyboardAvoidingView>
   );
@@ -293,7 +253,8 @@ const styles = StyleSheet.create({
   sendBtnDisabled: { backgroundColor: '#1e293b' },
   sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
 
-  mapContainer: { height: 220, overflow: 'hidden' },
+  mapContainer: { height: 220 },
+  map: { flex: 1 },
   mapOverlay: {
     ...StyleSheet.absoluteFillObject,
     zIndex: 10,
@@ -301,10 +262,4 @@ const styles = StyleSheet.create({
     alignItems: 'center', justifyContent: 'center',
   },
   mapOverlayText: { color: '#475569', fontSize: 13 },
-
-  driverDot: {
-    width: 16, height: 16, borderRadius: 8,
-    backgroundColor: '#3b82f6',
-    borderWidth: 2, borderColor: '#fff',
-  },
 });
