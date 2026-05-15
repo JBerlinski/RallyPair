@@ -8,13 +8,18 @@ import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
 import { socketStore } from '../socketStore';
 import { parseLocation } from '../utils/parseLocation';
+import { saveSession, clearSession } from '../utils/sessionStorage';
 import LeafletMap from '../components/LeafletMap';
 
 const STATUS = { CONNECTING: 'connecting', WAITING: 'waiting', PAIRED: 'paired' };
 
-export default function NavigatorScreen({ navigation }) {
+export default function NavigatorScreen({ navigation, route: navRoute }) {
+  const resumeRoomCode = navRoute.params?.resumeRoomCode ?? null;
+
   const socketRef = useRef(null);
   const mapRef = useRef(null);
+  const roomCodeRef = useRef(resumeRoomCode ?? '');
+  const needsRejoinRef = useRef(false);
   const firstDriverPos = useRef(false);
 
   const [status, setStatus] = useState(STATUS.CONNECTING);
@@ -24,22 +29,67 @@ export default function NavigatorScreen({ navigation }) {
   const [parsing, setParsing] = useState(false);
   const [sending, setSending] = useState(false);
   const [driverConnected, setDriverConnected] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+
+  const applyRoomCode = useCallback((code, hasDriver = false) => {
+    roomCodeRef.current = code;
+    setRoomCode(code);
+    setDriverConnected(hasDriver);
+    setStatus(hasDriver ? STATUS.PAIRED : STATUS.WAITING);
+    saveSession('navigator', code);
+  }, []);
+
+  const doCreateRoom = useCallback((socket) => {
+    socket.emit('create_room', (res) => {
+      if (res.ok) {
+        applyRoomCode(res.roomCode, false);
+      } else {
+        Alert.alert('Błąd', 'Nie udało się utworzyć pokoju');
+        navigation.goBack();
+      }
+    });
+  }, [applyRoomCode, navigation]);
+
+  const doRejoinOrCreate = useCallback((socket, code) => {
+    socket.emit('rejoin_navigator', { roomCode: code }, (res) => {
+      if (res.ok) {
+        applyRoomCode(res.roomCode, res.hasDriver);
+        setReconnecting(false);
+      } else {
+        // Room expired — create fresh room
+        doCreateRoom(socket);
+        setReconnecting(false);
+      }
+    });
+  }, [applyRoomCode, doCreateRoom]);
 
   useEffect(() => {
-    const socket = io(BACKEND_URL, { transports: ['websocket'] });
+    const socket = io(BACKEND_URL, {
+      transports: ['websocket'],
+      reconnectionAttempts: 10,
+      reconnectionDelay: 2000,
+    });
     socketRef.current = socket;
+    socketStore.setNavigator(socket);
 
     socket.on('connect', () => {
-      socket.emit('create_room', (res) => {
-        if (res.ok) {
-          socketStore.setNavigator(socket);
-          setRoomCode(res.roomCode);
-          setStatus(STATUS.WAITING);
-        } else {
-          Alert.alert('Błąd', 'Nie udało się utworzyć pokoju');
-          navigation.goBack();
-        }
-      });
+      if (needsRejoinRef.current && roomCodeRef.current) {
+        // Reconnected after drop — try to rejoin
+        needsRejoinRef.current = false;
+        setReconnecting(true);
+        doRejoinOrCreate(socket, roomCodeRef.current);
+      } else if (!roomCodeRef.current) {
+        // First connect — no saved session, create new room
+        doCreateRoom(socket);
+      } else {
+        // First connect with resume code
+        doRejoinOrCreate(socket, roomCodeRef.current);
+      }
+    });
+
+    socket.on('disconnect', () => {
+      needsRejoinRef.current = true;
+      setReconnecting(true);
     });
 
     socket.on('driver_joined', () => {
@@ -64,15 +114,15 @@ export default function NavigatorScreen({ navigation }) {
     });
 
     socket.on('connect_error', () => {
-      Alert.alert('Błąd połączenia', 'Nie można połączyć z serwerem.');
-      navigation.goBack();
+      // socket.io will keep retrying — no alert needed
     });
 
     return () => {
       socket.disconnect();
       socketStore.clearNavigator();
+      clearSession();
     };
-  }, []);
+  }, [doCreateRoom, doRejoinOrCreate]);
 
   const handleAddWaypoint = useCallback(async () => {
     if (!locationInput.trim()) return;
@@ -80,7 +130,7 @@ export default function NavigatorScreen({ navigation }) {
     try {
       const coords = await parseLocation(locationInput);
       if (!coords) {
-        Alert.alert('Nie znaleziono', 'Nie udało się rozpoznać lokalizacji. Spróbuj innego formatu lub adresu.');
+        Alert.alert('Nie znaleziono', 'Nie udało się rozpoznać lokalizacji.');
         return;
       }
       const label = coords.displayName || locationInput.trim();
@@ -116,7 +166,7 @@ export default function NavigatorScreen({ navigation }) {
     setTimeout(() => setSending(false), 800);
   }, [waypoints]);
 
-  if (status === STATUS.CONNECTING) {
+  if (status === STATUS.CONNECTING && !reconnecting) {
     return (
       <View style={styles.centered}>
         <ActivityIndicator size="large" color="#3b82f6" />
@@ -132,13 +182,23 @@ export default function NavigatorScreen({ navigation }) {
     >
       <StatusBar barStyle="light-content" />
 
-      {/* Upper section */}
       <View style={styles.upper}>
+        {reconnecting && (
+          <View style={styles.reconnectBanner}>
+            <ActivityIndicator size="small" color="#f59e0b" style={{ marginRight: 8 }} />
+            <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
+          </View>
+        )}
+
         <View style={styles.codeBox}>
           <Text style={styles.codeLabel}>Kod pokoju</Text>
-          <Text style={styles.codeText}>{roomCode}</Text>
+          <Text style={styles.codeText}>{roomCode || '——'}</Text>
           <Text style={styles.codeHint}>
-            {status === STATUS.WAITING ? 'Czekam na kierowcę…' : '✅ Kierowca połączony'}
+            {reconnecting
+              ? 'Łączenie…'
+              : status === STATUS.WAITING
+                ? 'Czekam na kierowcę…'
+                : '✅ Kierowca połączony'}
           </Text>
         </View>
 
@@ -192,7 +252,6 @@ export default function NavigatorScreen({ navigation }) {
         </TouchableOpacity>
       </View>
 
-      {/* Map section */}
       <View style={styles.mapContainer}>
         {!driverConnected && (
           <View style={styles.mapOverlay} pointerEvents="none">
@@ -209,6 +268,13 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f172a' },
   centered: { flex: 1, backgroundColor: '#0f172a', alignItems: 'center', justifyContent: 'center' },
   statusText: { color: '#94a3b8', marginTop: 12, fontSize: 15 },
+
+  reconnectBanner: {
+    flexDirection: 'row', alignItems: 'center',
+    backgroundColor: '#78350f', borderRadius: 8,
+    padding: 10, marginBottom: 10,
+  },
+  reconnectText: { color: '#fef3c7', fontSize: 13 },
 
   upper: { flex: 1, padding: 16 },
 
@@ -237,27 +303,20 @@ const styles = StyleSheet.create({
     backgroundColor: '#1e293b', borderRadius: 10,
     padding: 10, marginBottom: 6,
   },
-  waypointIndex: {
-    color: '#3b82f6', fontWeight: '700', fontSize: 15,
-    width: 22, textAlign: 'center', marginRight: 8,
-  },
+  waypointIndex: { color: '#3b82f6', fontWeight: '700', fontSize: 15, width: 22, textAlign: 'center', marginRight: 8 },
   waypointLabel: { flex: 1, color: '#e2e8f0', fontSize: 13 },
   removeBtn: { padding: 6 },
   removeBtnText: { color: '#ef4444', fontSize: 15 },
   emptyText: { color: '#334155', textAlign: 'center', marginTop: 16, fontSize: 13 },
 
-  sendBtn: {
-    backgroundColor: '#059669', borderRadius: 12,
-    padding: 14, alignItems: 'center', marginTop: 6,
-  },
+  sendBtn: { backgroundColor: '#059669', borderRadius: 12, padding: 14, alignItems: 'center', marginTop: 6 },
   sendBtnDisabled: { backgroundColor: '#1e293b' },
   sendBtnText: { color: '#fff', fontSize: 15, fontWeight: '700' },
 
   mapContainer: { height: 220 },
   map: { flex: 1 },
   mapOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    zIndex: 10,
+    ...StyleSheet.absoluteFillObject, zIndex: 10,
     backgroundColor: 'rgba(15,23,42,0.75)',
     alignItems: 'center', justifyContent: 'center',
   },

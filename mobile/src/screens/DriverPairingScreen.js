@@ -7,9 +7,11 @@ import {
 import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
 import { socketStore } from '../socketStore';
+import { saveSession } from '../utils/sessionStorage';
 
-export default function DriverPairingScreen({ navigation }) {
-  const [code, setCode] = useState('');
+export default function DriverPairingScreen({ navigation, route: navRoute }) {
+  const resumeCode = navRoute.params?.resumeCode ?? '';
+  const [code, setCode] = useState(resumeCode);
   const [loading, setLoading] = useState(false);
   const socketRef = useRef(null);
 
@@ -21,15 +23,19 @@ export default function DriverPairingScreen({ navigation }) {
     }
     setLoading(true);
 
-    const socket = io(BACKEND_URL, { transports: ['websocket'] });
+    const socket = io(BACKEND_URL, {
+      transports: ['websocket'],
+      reconnectionAttempts: 10,
+      reconnectionDelay: 2000,
+    });
     socketRef.current = socket;
 
     socket.on('connect', () => {
       socket.emit('join_room', { roomCode: trimmed }, (res) => {
         if (res.ok) {
           socketStore.setDriver(socket);
+          saveSession('driver', trimmed);
           setLoading(false);
-          // Pass only serializable primitives — socket lives in socketStore
           navigation.replace('DriverMap', { roomCode: trimmed });
         } else {
           socket.disconnect();

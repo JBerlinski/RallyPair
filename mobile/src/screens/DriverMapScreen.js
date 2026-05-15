@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, Alert, StatusBar,
+  View, Text, StyleSheet, TouchableOpacity, Alert, StatusBar, ActivityIndicator,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
 import LeafletMap from '../components/LeafletMap';
 import { socketStore } from '../socketStore';
+import { clearSession } from '../utils/sessionStorage';
 import { fetchRoute } from '../utils/osrm';
 
 const POSITION_INTERVAL_MS = 3000;
@@ -16,23 +17,22 @@ export default function DriverMapScreen({ route }) {
   const mapRef = useRef(null);
   const locationSubRef = useRef(null);
   const lastSentRef = useRef(0);
-  const lastPositionRef = useRef(null);  // driver's own GPS — used as route origin
+  const lastPositionRef = useRef(null);
   const routeCoordsRef = useRef([]);
+  const needsRejoinRef = useRef(false);
 
   const [connected, setConnected] = useState(true);
+  const [reconnecting, setReconnecting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('Czekam na trasę od nawigatora…');
   const [currentStep, setCurrentStep] = useState(null);
   const [overview, setOverview] = useState(false);
 
-  // GPS tracking — show own position on map + send to navigator
+  // GPS tracking
   useEffect(() => {
     let active = true;
     (async () => {
       const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') {
-        console.warn('[GPS] Permission denied');
-        return;
-      }
+      if (status !== 'granted') { console.warn('[GPS] Permission denied'); return; }
       if (!active) return;
 
       locationSubRef.current = await Location.watchPositionAsync(
@@ -41,11 +41,9 @@ export default function DriverMapScreen({ route }) {
           if (!active) return;
           const { latitude, longitude } = loc.coords;
 
-          // Show on driver's own map (bug #1 fix)
           mapRef.current?.updateDriver(latitude, longitude);
           lastPositionRef.current = { lat: latitude, lng: longitude };
 
-          // Throttle send to navigator
           const now = Date.now();
           if (now - lastSentRef.current < POSITION_INTERVAL_MS) return;
           lastSentRef.current = now;
@@ -59,7 +57,7 @@ export default function DriverMapScreen({ route }) {
     };
   }, [socket]);
 
-  // WebSocket listeners
+  // WebSocket listeners + reconnect logic
   useEffect(() => {
     if (!socket) {
       setStatusMsg('Brak połączenia z serwerem.');
@@ -74,14 +72,12 @@ export default function DriverMapScreen({ route }) {
       setStatusMsg('Wyznaczam trasę…');
       mapRef.current?.updateWaypoints(wps);
 
-      // Prepend driver's GPS as route origin (bug #2 fix)
       const origin = lastPositionRef.current;
       const routePoints = origin ? [origin, ...wps] : wps;
       console.log('[DriverMap] fetchRoute with', routePoints.length, 'points, origin:', !!origin);
 
       const result = await fetchRoute(routePoints);
       if (!result) {
-        console.warn('[DriverMap] fetchRoute returned null — need ≥2 points or OSRM error');
         setStatusMsg(origin
           ? 'Nie udało się wyznaczyć trasy — sprawdź połączenie.'
           : 'Oczekuję na sygnał GPS przed wyznaczeniem trasy…');
@@ -91,7 +87,6 @@ export default function DriverMapScreen({ route }) {
       routeCoordsRef.current = result.coordinates;
       setCurrentStep(result.steps[0] ?? null);
       setStatusMsg('');
-
       mapRef.current?.updateRoute(result.coordinates);
       mapRef.current?.fitRoute(result.coordinates);
 
@@ -101,30 +96,69 @@ export default function DriverMapScreen({ route }) {
 
     const onRoomClosed = () => {
       setConnected(false);
+      clearSession();
       Alert.alert('Rozłączono', 'Nawigator zakończył sesję.');
+    };
+
+    const onNavigatorReconnecting = () => {
+      setStatusMsg('Nawigator się rozłączył, próba ponownego połączenia…');
+    };
+
+    const onNavigatorRejoined = () => {
+      setStatusMsg('Nawigator ponownie połączony.');
+      setTimeout(() => setStatusMsg(''), 2000);
+    };
+
+    const onDisconnect = () => {
+      needsRejoinRef.current = true;
+      setConnected(false);
+      setReconnecting(true);
+    };
+
+    const onConnect = () => {
+      setConnected(true);
+      if (needsRejoinRef.current) {
+        needsRejoinRef.current = false;
+        socket.emit('rejoin_driver', { roomCode }, (res) => {
+          setReconnecting(false);
+          if (!res?.ok) {
+            clearSession();
+            Alert.alert('Sesja wygasła', 'Pokój nie istnieje. Wróć do menu.', [
+              { text: 'OK', onPress: () => {} },
+            ]);
+            setStatusMsg('Sesja wygasła.');
+          } else {
+            setStatusMsg('');
+          }
+        });
+      } else {
+        setReconnecting(false);
+      }
     };
 
     socket.on('route_update', onRouteUpdate);
     socket.on('room_closed', onRoomClosed);
-    socket.on('disconnect', () => setConnected(false));
-    socket.on('connect', () => setConnected(true));
+    socket.on('navigator_reconnecting', onNavigatorReconnecting);
+    socket.on('navigator_rejoined', onNavigatorRejoined);
+    socket.on('disconnect', onDisconnect);
+    socket.on('connect', onConnect);
 
     return () => {
       socket.off('route_update', onRouteUpdate);
       socket.off('room_closed', onRoomClosed);
-      socket.off('disconnect');
-      socket.off('connect');
+      socket.off('navigator_reconnecting', onNavigatorReconnecting);
+      socket.off('navigator_rejoined', onNavigatorRejoined);
+      socket.off('disconnect', onDisconnect);
+      socket.off('connect', onConnect);
       socket.disconnect();
       socketStore.clearDriver();
     };
-  }, [socket]);
+  }, [socket, roomCode]);
 
   const handleOverviewToggle = () => {
     setOverview((v) => {
       const next = !v;
-      if (next && routeCoordsRef.current.length > 0) {
-        mapRef.current?.fitRoute(routeCoordsRef.current);
-      }
+      if (next && routeCoordsRef.current.length > 0) mapRef.current?.fitRoute(routeCoordsRef.current);
       return next;
     });
   };
@@ -132,15 +166,22 @@ export default function DriverMapScreen({ route }) {
   return (
     <View style={styles.container}>
       <StatusBar hidden />
-
       <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} />
 
       <View style={styles.topBar}>
         <Text style={styles.roomCode}>Pokój: {roomCode}</Text>
-        <View style={[styles.dot, connected ? styles.dotGreen : styles.dotRed]} />
+        {reconnecting
+          ? <ActivityIndicator size="small" color="#f59e0b" />
+          : <View style={[styles.dot, connected ? styles.dotGreen : styles.dotRed]} />}
       </View>
 
-      {currentStep && !overview && (
+      {reconnecting && (
+        <View style={styles.reconnectBanner}>
+          <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
+        </View>
+      )}
+
+      {currentStep && !overview && !reconnecting && (
         <View style={styles.instructionBox}>
           <Text style={styles.instructionText}>
             {currentStep.modifier
@@ -152,7 +193,7 @@ export default function DriverMapScreen({ route }) {
         </View>
       )}
 
-      {statusMsg !== '' && (
+      {statusMsg !== '' && !reconnecting && (
         <View style={styles.statusBox}>
           <Text style={styles.statusText}>{statusMsg}</Text>
         </View>
@@ -177,6 +218,12 @@ const styles = StyleSheet.create({
   dot: { width: 10, height: 10, borderRadius: 5 },
   dotGreen: { backgroundColor: '#22c55e' },
   dotRed: { backgroundColor: '#ef4444' },
+  reconnectBanner: {
+    position: 'absolute', top: 52, left: 12, right: 12,
+    backgroundColor: '#78350f', borderRadius: 8,
+    padding: 10, alignItems: 'center',
+  },
+  reconnectText: { color: '#fef3c7', fontSize: 13 },
   instructionBox: {
     position: 'absolute', bottom: 90, left: 12, right: 12,
     backgroundColor: 'rgba(15,23,42,0.92)', borderRadius: 14,
