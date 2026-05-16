@@ -35,6 +35,8 @@ export async function fetchRoute(waypoints) {
           latitude: step.maneuver.location[1],
           longitude: step.maneuver.location[0],
         },
+        bearingBefore: step.maneuver.bearing_before ?? null,
+        bearingAfter: step.maneuver.bearing_after ?? null,
       }))
     );
 
