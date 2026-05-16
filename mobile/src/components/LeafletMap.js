@@ -38,7 +38,7 @@ const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) 
       const h = heading != null ? heading : 'undefined';
       exec(`updateDriver(${lat},${lng},${h})`);
     },
-    updateWaypoints(wps) { exec(`updateWaypoints(${JSON.stringify(wps)})`); },
+    updateWaypoints(wps, noPan) { exec(`updateWaypoints(${JSON.stringify(wps)},${!!noPan})`); },
     updateRoute(coords)  { exec(`updateRoute(${JSON.stringify(coords)})`); },
     fitRoute(coords)     { exec(`fitRoute(${JSON.stringify(coords)})`); },
     panTo(lat, lng, zoom){ exec(`panTo(${lat},${lng},${zoom != null ? zoom : 'undefined'})`); },

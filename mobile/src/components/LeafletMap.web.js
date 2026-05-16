@@ -40,7 +40,7 @@ const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) 
 
   useImperativeHandle(ref, () => ({
     updateDriver(lat, lng, heading) { send({ t: 'driver', lat, lng, heading: heading ?? null }); },
-    updateWaypoints(wps)            { send({ t: 'waypoints', wps }); },
+    updateWaypoints(wps, noPan)     { send({ t: 'waypoints', wps, noPan: !!noPan }); },
     updateRoute(coords)             { send({ t: 'route', coords }); },
     fitRoute(coords)                { send({ t: 'fit', coords }); },
     panTo(lat, lng, zoom)           { send({ t: 'pan', lat, lng, zoom: zoom ?? null }); },

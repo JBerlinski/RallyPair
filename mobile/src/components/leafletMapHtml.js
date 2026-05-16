@@ -82,8 +82,10 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
       navTiltActive=!!enable;
       var el=document.getElementById('map');
       if(navTiltActive){
+        // rotateX(20°) with scaleY(1.07) fully compensates for top-edge clipping
+        // at this angle so no black bar appears above the map
         el.style.transformOrigin='50% 100%';
-        el.style.transform='perspective(500px) rotateX(40deg)';
+        el.style.transform='perspective(800px) rotateX(20deg) scaleY(1.07)';
       }else{
         el.style.transformOrigin='';
         el.style.transform='';
@@ -96,7 +98,7 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
       tileLayer=L.tileLayer(url,{maxZoom:19}).addTo(map);
     }
 
-    function updateWaypoints(wps){
+    function updateWaypoints(wps,noPan){
       waypointMarkers.forEach(function(m){map.removeLayer(m)});
       waypointMarkers=[];
       editingIndex=-1; editingOriginalLL=null;
@@ -118,7 +120,8 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
         })(i);
         waypointMarkers.push(m);
       });
-      if(wps.length>0) map.setView([wps[0].lat,wps[0].lng],13,{animate:true});
+      // noPan=true on driver side — camera is controlled by GPS, not waypoint position
+      if(!noPan && wps.length>0) map.setView([wps[0].lat,wps[0].lng],13,{animate:true});
     }
 
     function editWaypoint(index){
@@ -178,7 +181,7 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
       try{
         var msg=JSON.parse(e.data);
         if(msg.t==='driver')         updateDriver(msg.lat,msg.lng,msg.heading);
-        else if(msg.t==='waypoints') updateWaypoints(msg.wps);
+        else if(msg.t==='waypoints') updateWaypoints(msg.wps,msg.noPan);
         else if(msg.t==='route')     updateRoute(msg.coords);
         else if(msg.t==='fit')       fitRoute(msg.coords);
         else if(msg.t==='pan')       panTo(msg.lat,msg.lng,msg.zoom);
