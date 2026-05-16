@@ -114,16 +114,10 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
     return () => { socket.disconnect(); socketStore.clearNavigator(); clearSession(); };
   }, [doCreateRoom, doRejoinOrCreate]);
 
-  // Sync waypoints to map + draw route
+  // Sync waypoint markers to map; clear stale route if < 2 waypoints remain
   useEffect(() => {
     mapRef.current?.updateWaypoints(waypoints);
-    if (waypoints.length < 2) {
-      mapRef.current?.updateRoute([]);
-      return;
-    }
-    fetchRoute(waypoints).then((result) => {
-      mapRef.current?.updateRoute(result?.coordinates ?? []);
-    });
+    if (waypoints.length < 2) mapRef.current?.updateRoute([]);
   }, [waypoints]);
 
   // Messages from Leaflet map (waypoint clicks, drag results)
@@ -194,11 +188,16 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
     setEditingNewPos(null);
   }, []);
 
-  const handleSendRoute = useCallback(() => {
+  const handleSendRoute = useCallback(async () => {
     if (waypoints.length === 0) return;
     setSending(true);
     socketRef.current?.emit('send_route', { waypoints });
-    setTimeout(() => setSending(false), 800);
+    // Draw route on navigator map after sending
+    if (waypoints.length >= 2) {
+      const result = await fetchRoute(waypoints);
+      mapRef.current?.updateRoute(result?.coordinates ?? []);
+    }
+    setSending(false);
   }, [waypoints]);
 
   const handleCenter = useCallback(async () => {
