@@ -47,6 +47,7 @@ const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) 
     editWaypoint(index)  { exec(`editWaypoint(${index})`); },
     cancelEditWaypoint() { exec(`cancelEditWaypoint()`); },
     confirmEditWaypoint(){ exec(`confirmEditWaypoint()`); },
+    setNavTilt(enable)   { exec(`setNavTilt(${!!enable})`); },
   }), [exec]);
 
   return (

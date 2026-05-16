@@ -54,6 +54,10 @@ export default function DriverMapScreen({ navigation, route }) {
   const needsRejoinRef = useRef(false);
   const settingsRef = useRef(getCachedSettings());
 
+  // headingLock: when true the map rotates with GPS heading and perspective tilt is on.
+  // When false the map stays north-up (user manually broke out of tracking).
+  const headingLockRef = useRef(true);
+
   const [connected, setConnected] = useState(true);
   const [reconnecting, setReconnecting] = useState(false);
   const [statusMsg, setStatusMsg] = useState('Czekam na trasę od nawigatora…');
@@ -61,6 +65,7 @@ export default function DriverMapScreen({ navigation, route }) {
   const [distToStep, setDistToStep] = useState(null);
   const [navMode, setNavMode] = useState(null); // null | 'follow' | 'overview'
   const [bearing, setBearing] = useState(0);
+  const [headingLock, setHeadingLock] = useState(true); // for compass visual
 
   // Toast
   const toastAnim = useRef(new Animated.Value(0)).current;
@@ -77,15 +82,33 @@ export default function DriverMapScreen({ navigation, route }) {
     }, 1500);
   }, [toastAnim]);
 
-  // Helper: apply bearing to map and update state
   const applyBearing = useCallback((deg) => {
     mapRef.current?.setBearing(deg);
     setBearing(deg);
   }, []);
 
-  const handleCompassPress = useCallback(() => applyBearing(0), [applyBearing]);
+  // Compass tap: toggle heading-lock mode
+  const handleCompassPress = useCallback(() => {
+    const newLock = !headingLockRef.current;
+    headingLockRef.current = newLock;
+    setHeadingLock(newLock);
 
-  // Apply tile and settings on every focus
+    if (newLock) {
+      // Re-engage tracking: snap to current heading immediately
+      if (currentHeadingRef.current != null) applyBearing(currentHeadingRef.current);
+      // Re-enable tilt only if a route is active (navMode === 'follow')
+      setNavMode((mode) => {
+        if (mode === 'follow') mapRef.current?.setNavTilt(true);
+        return mode;
+      });
+    } else {
+      // Break out to north-up, flat view
+      applyBearing(0);
+      mapRef.current?.setNavTilt(false);
+    }
+  }, [applyBearing]);
+
+  // Tile + settings refresh on every focus
   useFocusEffect(useCallback(() => {
     loadSettings().then((s) => {
       settingsRef.current = s;
@@ -116,11 +139,12 @@ export default function DriverMapScreen({ navigation, route }) {
           setNavMode((mode) => {
             if (mode === 'follow') {
               mapRef.current?.panTo(latitude, longitude, NAV_ZOOM);
-              if (hdg != null) {
+              if (headingLockRef.current && hdg != null) {
                 mapRef.current?.setBearing(hdg);
                 setBearing(hdg);
               }
-            } else {
+            } else if (mode !== 'overview') {
+              // null mode: respect per-setting behaviour
               const cfg = settingsRef.current;
               if (cfg.autoCenter) mapRef.current?.panTo(latitude, longitude);
               if (cfg.compassRotation && hdg != null) {
@@ -139,8 +163,7 @@ export default function DriverMapScreen({ navigation, route }) {
               const step = steps[idx];
               const dist = haversine(latitude, longitude, step.location.latitude, step.location.longitude);
               setDistToStep(dist);
-              const threshold = getThreshold(step.ref);
-              if (dist < threshold && idx + 1 < steps.length) {
+              if (dist < getThreshold(step.ref) && idx + 1 < steps.length) {
                 stepIdxRef.current = idx + 1;
                 setCurrentStep(steps[idx + 1]);
                 setDistToStep(null);
@@ -163,7 +186,7 @@ export default function DriverMapScreen({ navigation, route }) {
     };
   }, [socket]);
 
-  // Socket listeners + reconnect
+  // Socket listeners
   useEffect(() => {
     if (!socket) { setStatusMsg('Brak połączenia z serwerem.'); return; }
 
@@ -195,13 +218,14 @@ export default function DriverMapScreen({ navigation, route }) {
 
       if (origin) {
         mapRef.current?.panTo(origin.lat, origin.lng, NAV_ZOOM);
-        if (currentHeadingRef.current != null) {
-          applyBearing(currentHeadingRef.current);
-        }
+        if (currentHeadingRef.current != null) applyBearing(currentHeadingRef.current);
       } else {
         mapRef.current?.fitRoute(result.coordinates);
       }
+
+      // Enter follow mode + tilt if heading lock is on
       setNavMode('follow');
+      if (headingLockRef.current) mapRef.current?.setNavTilt(true);
 
       try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); } catch {}
       showToast(`Nowa trasa → ${wps[wps.length - 1].label || 'cel zaktualizowany'}`);
@@ -265,25 +289,29 @@ export default function DriverMapScreen({ navigation, route }) {
     };
   }, [socket, roomCode, applyBearing, showToast]);
 
-  // Toggle between full-route overview and navigation follow view
+  // Toggle full-route overview ↔ navigation follow
   const handleNavToggle = useCallback(() => {
     setNavMode((prev) => {
       if (prev === 'overview') {
+        // Return to follow + restore tilt/bearing if heading-locked
         const pos = lastPositionRef.current;
         if (pos) {
           mapRef.current?.panTo(pos.lat, pos.lng, NAV_ZOOM);
-          if (currentHeadingRef.current != null) {
+          if (headingLockRef.current && currentHeadingRef.current != null) {
             mapRef.current?.setBearing(currentHeadingRef.current);
             setBearing(currentHeadingRef.current);
           }
         }
+        if (headingLockRef.current) mapRef.current?.setNavTilt(true);
         return 'follow';
       } else {
+        // Full route view: north-up, flat
         if (routeCoordsRef.current.length > 0) {
           mapRef.current?.fitRoute(routeCoordsRef.current);
           mapRef.current?.setBearing(0);
           setBearing(0);
         }
+        mapRef.current?.setNavTilt(false);
         return 'overview';
       }
     });
@@ -298,7 +326,7 @@ export default function DriverMapScreen({ navigation, route }) {
       <StatusBar hidden />
       <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} />
 
-      {/* Maneuver island — top, leaves room on right for compass */}
+      {/* Maneuver island — tall, column layout for quick at-a-glance reading */}
       {currentStep && !reconnecting && (
         <View style={styles.maneuverIsland}>
           <ManeuverIcon
@@ -306,15 +334,13 @@ export default function DriverMapScreen({ navigation, route }) {
             modifier={currentStep.modifier}
             bearingBefore={currentStep.bearingBefore}
             bearingAfter={currentStep.bearingAfter}
-            size={52}
+            size={80}
           />
-          <View style={styles.maneuverBody}>
-            <Text style={styles.maneuverName} numberOfLines={1}>
-              {arrived
-                ? 'Dotarłeś do celu'
-                : (currentStep.name || currentStep.modifier || currentStep.instruction)}
-            </Text>
-          </View>
+          <Text style={styles.maneuverName} numberOfLines={2}>
+            {arrived
+              ? 'Dotarłeś do celu'
+              : (currentStep.name || currentStep.modifier || currentStep.instruction)}
+          </Text>
           {!arrived && (
             <Text style={styles.maneuverDist}>
               {distToStep != null ? fmtDist(distToStep) : fmtDist(currentStep.distance)}
@@ -338,16 +364,19 @@ export default function DriverMapScreen({ navigation, route }) {
         </View>
       )}
 
-      {/* Compass — top-right, below maneuver island */}
-      <NorthCompass bearing={bearing} onPress={handleCompassPress} style={styles.compass} />
+      {/* Compass — top-right, shows active tracking state */}
+      <NorthCompass
+        bearing={bearing}
+        headingLock={headingLock}
+        onPress={handleCompassPress}
+        style={styles.compass}
+      />
 
-      {/* Toast notification — slides in from top */}
+      {/* Toast — slides in from top, auto-dismisses */}
       <Animated.View
         style={[styles.toast, {
           opacity: toastAnim,
-          transform: [{
-            translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-60, 0] }),
-          }],
+          transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-60, 0] }) }],
         }]}
         pointerEvents="none"
       >
@@ -384,43 +413,44 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000' },
 
   maneuverIsland: {
-    position: 'absolute', top: 14, left: 14, right: 66,
-    backgroundColor: 'rgba(15,23,42,0.93)',
-    borderRadius: 16, paddingHorizontal: 12, paddingVertical: 10,
-    flexDirection: 'row', alignItems: 'center',
+    position: 'absolute', top: 14, left: 14, right: 14,
+    backgroundColor: 'rgba(15,23,42,0.95)',
+    borderRadius: 18,
+    paddingHorizontal: 16, paddingTop: 16, paddingBottom: 14,
+    alignItems: 'center',
     shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.45, shadowRadius: 8, elevation: 10,
+    shadowOpacity: 0.5, shadowRadius: 10, elevation: 12,
   },
-  statusIsland: { backgroundColor: 'rgba(15,23,42,0.82)' },
-  maneuverBody: { flex: 1, marginLeft: 10 },
-  maneuverName: { color: '#f1f5f9', fontSize: 14, fontWeight: '600' },
-  maneuverDist: { color: '#3b82f6', fontSize: 17, fontWeight: '800', marginLeft: 8 },
-  statusText: { color: '#94a3b8', fontSize: 14, flex: 1, textAlign: 'center' },
+  statusIsland: {
+    paddingVertical: 18,
+    backgroundColor: 'rgba(15,23,42,0.82)',
+  },
+  maneuverName: {
+    color: '#f1f5f9', fontSize: 18, fontWeight: '700',
+    textAlign: 'center', marginTop: 10, lineHeight: 24,
+  },
+  maneuverDist: {
+    color: '#3b82f6', fontSize: 26, fontWeight: '800',
+    textAlign: 'center', marginTop: 6, letterSpacing: 0.5,
+  },
+  statusText: { color: '#94a3b8', fontSize: 15, textAlign: 'center' },
 
   compass: {
-    position: 'absolute', top: 14, right: 14,
+    position: 'absolute', top: 14, right: 14, zIndex: 20,
   },
 
   toast: {
-    position: 'absolute',
-    top: 84,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(15,23,42,0.96)',
-    borderRadius: 12,
-    paddingHorizontal: 16,
-    paddingVertical: 11,
-    alignItems: 'center',
-    elevation: 20,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.45,
-    shadowRadius: 8,
+    position: 'absolute', top: 8, left: 20, right: 20,
+    backgroundColor: 'rgba(15,23,42,0.97)',
+    borderRadius: 12, paddingHorizontal: 16, paddingVertical: 11,
+    alignItems: 'center', elevation: 20,
+    shadowColor: '#000', shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.5, shadowRadius: 8,
   },
   toastText: { color: '#f1f5f9', fontSize: 15, fontWeight: '600', textAlign: 'center' },
 
   reconnectBanner: {
-    position: 'absolute', top: 84, left: 12, right: 12,
+    position: 'absolute', top: 220, left: 12, right: 12,
     backgroundColor: '#78350f', borderRadius: 10,
     paddingHorizontal: 14, paddingVertical: 10,
     flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
@@ -435,13 +465,10 @@ const styles = StyleSheet.create({
   },
   dot: { width: 8, height: 8, borderRadius: 4, marginRight: 7 },
   dotGreen: { backgroundColor: '#22c55e' },
-  dotRed: { backgroundColor: '#ef4444' },
+  dotRed:   { backgroundColor: '#ef4444' },
   roomCode: { color: '#94a3b8', fontSize: 13, fontWeight: '600', letterSpacing: 1 },
 
-  fabCol: {
-    position: 'absolute', bottom: 28, right: 16,
-    gap: 12,
-  },
+  fabCol: { position: 'absolute', bottom: 28, right: 16, gap: 12 },
   fab: {
     width: 52, height: 52, borderRadius: 26,
     backgroundColor: 'rgba(15,23,42,0.9)',

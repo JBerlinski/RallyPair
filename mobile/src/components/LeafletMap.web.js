@@ -49,6 +49,7 @@ const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) 
     editWaypoint(index)             { send({ t: 'editWp', index }); },
     cancelEditWaypoint()            { send({ t: 'cancelEdit' }); },
     confirmEditWaypoint()           { send({ t: 'confirmEdit' }); },
+    setNavTilt(enable)              { send({ t: 'navTilt', enable: !!enable }); },
   }));
 
   const containerStyle = {

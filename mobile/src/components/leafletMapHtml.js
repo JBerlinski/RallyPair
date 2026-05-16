@@ -19,7 +19,8 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
   <div id="map"></div>
   <script>
     var map = L.map('map',{
-      rotate:true, bearing:0, zoomControl:false, attributionControl:false
+      rotate:true, bearing:0, zoomControl:false, attributionControl:false,
+      touchRotate:true, touchGestures:true
     }).setView([52.237,21.017],12);
 
     var tileLayer = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19}).addTo(map);
@@ -74,6 +75,20 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
 
     function setBearing(deg){
       try{if(map.setBearing)map.setBearing(deg);}catch(e){}
+    }
+
+    var navTiltActive=false;
+    function setNavTilt(enable){
+      navTiltActive=!!enable;
+      var el=document.getElementById('map');
+      if(navTiltActive){
+        el.style.transformOrigin='50% 100%';
+        el.style.transform='perspective(500px) rotateX(40deg)';
+      }else{
+        el.style.transformOrigin='';
+        el.style.transform='';
+      }
+      try{map.invalidateSize({animate:false});}catch(e){}
     }
 
     function setTileUrl(url){
@@ -172,6 +187,7 @@ export const LEAFLET_MAP_HTML = `<!DOCTYPE html>
         else if(msg.t==='editWp')    editWaypoint(msg.index);
         else if(msg.t==='cancelEdit')cancelEditWaypoint();
         else if(msg.t==='confirmEdit')confirmEditWaypoint();
+        else if(msg.t==='navTilt')   setNavTilt(msg.enable);
       }catch(err){}
     });
 
