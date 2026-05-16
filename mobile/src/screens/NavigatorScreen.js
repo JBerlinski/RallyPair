@@ -191,12 +191,28 @@ export default function NavigatorScreen({ navigation, route: navRoute }) {
   const handleSendRoute = useCallback(async () => {
     if (waypoints.length === 0) return;
     setSending(true);
+
+    console.log('[NAV] handleSendRoute: emitting, waypoints:', waypoints.length);
     socketRef.current?.emit('send_route', { waypoints });
-    // Draw route on navigator map after sending
+
     if (waypoints.length >= 2) {
+      console.log('[NAV] fetchRoute start, wps:', JSON.stringify(waypoints.map(w => ({ lat: w.lat, lng: w.lng }))));
       const result = await fetchRoute(waypoints);
-      mapRef.current?.updateRoute(result?.coordinates ?? []);
+      console.log('[NAV] fetchRoute result:', result ? `OK ${result.coordinates.length} coords` : 'NULL');
+
+      if (!result || !result.coordinates?.length) {
+        console.warn('[NAV] No route — skipping map draw');
+        setSending(false);
+        return;
+      }
+
+      console.log('[NAV] calling mapRef.current?.updateRoute, ref exists:', !!mapRef.current);
+      mapRef.current?.updateRoute(result.coordinates);
+      console.log('[NAV] calling fitRoute');
+      mapRef.current?.fitRoute(result.coordinates);
+      console.log('[NAV] done');
     }
+
     setSending(false);
   }, [waypoints]);
 
