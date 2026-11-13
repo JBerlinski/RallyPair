@@ -1,49 +1,59 @@
-// Parses user input into { lat, lng } or returns null
+// Turns what the navigator typed into map places: [{ lat, lng, label }].
+// Understands plain coordinates, Google Maps links and free-text addresses.
 
-const COORD_RE = /(-?\d+\.?\d*)[,\s]+(-?\d+\.?\d*)/;
+const NUM = '(-?\\d{1,3}(?:\\.\\d+)?)';
+// The whole input must be a coordinate pair — "Długa 10, 00-950" is an address, not coords.
+const COORD_RE = new RegExp(`^\\s*${NUM}\\s*[,;\\s]\\s*${NUM}\\s*$`);
+const URL_PATTERNS = [
+  new RegExp(`!3d${NUM}!4d${NUM}`),          // exact pin in a Google Maps place link
+  new RegExp(`[?&](?:q|query|ll|destination)=${NUM}(?:,|%2C)${NUM}`),
+  new RegExp(`@${NUM},${NUM}`),              // map viewport centre
+];
 
-// Google Maps short URL: maps.app.goo.gl or goo.gl/maps — needs resolve (not done here)
-// Google Maps full URL: @lat,lng or q=lat,lng or ll=lat,lng
-const GMAPS_AT_RE = /@(-?\d+\.?\d*),(-?\d+\.?\d*)/;
-const GMAPS_Q_RE = /[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)/;
-const GMAPS_LL_RE = /[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)/;
+const valid = (lat, lng) => Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+const coordLabel = (lat, lng) => `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
 
-function tryCoords(text) {
+export function parseCoords(text) {
   const clean = text.trim();
-
-  let m = clean.match(GMAPS_AT_RE) || clean.match(GMAPS_Q_RE) || clean.match(GMAPS_LL_RE);
-  if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
-
-  m = clean.match(COORD_RE);
-  if (m) {
+  const patterns = /^https?:\/\//i.test(clean) ? URL_PATTERNS : [COORD_RE];
+  for (const re of patterns) {
+    const m = clean.match(re);
+    if (!m) continue;
     const lat = parseFloat(m[1]);
     const lng = parseFloat(m[2]);
-    if (lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180) {
-      return { lat, lng };
-    }
+    if (valid(lat, lng)) return { lat, lng, label: coordLabel(lat, lng) };
   }
-
   return null;
 }
 
-async function geocodeNominatim(address) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`;
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'RallyPair/1.0' },
-  });
-  const data = await res.json();
-  if (data.length === 0) return null;
-  return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), displayName: data[0].display_name };
+// "Krupówki, Zakopane, powiat tatrzański, …" → "Krupówki, Zakopane"
+function shortName(displayName) {
+  return displayName.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 3).join(', ');
 }
 
-export async function parseLocation(input) {
+export async function searchPlaces(input, { signal } = {}) {
   const text = input.trim();
-  if (!text) return null;
+  if (!text) return [];
+  const direct = parseCoords(text);
+  if (direct) return [direct];
+  if (/^https?:\/\//i.test(text)) return []; // a link we cannot read (e.g. shortened)
 
-  // 1. Try direct coords / URL coords
-  const direct = tryCoords(text);
-  if (direct) return direct;
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=5&accept-language=pl&q=${encodeURIComponent(text)}`;
+  const res = await fetch(url, { signal });
+  const data = await res.json();
+  const seen = new Set();
+  return (Array.isArray(data) ? data : [])
+    .map((r) => ({ lat: parseFloat(r.lat), lng: parseFloat(r.lon), label: shortName(r.display_name) }))
+    .filter((r) => !seen.has(r.label) && seen.add(r.label));
+}
 
-  // 2. Geocode as address via Nominatim
-  return await geocodeNominatim(text);
+export async function reverseGeocode(lat, lng) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=json&zoom=17&lat=${lat}&lon=${lng}&accept-language=pl`;
+    const res = await fetch(url);
+    const data = await res.json();
+    return data.display_name ? shortName(data.display_name) : coordLabel(lat, lng);
+  } catch {
+    return coordLabel(lat, lng);
+  }
 }

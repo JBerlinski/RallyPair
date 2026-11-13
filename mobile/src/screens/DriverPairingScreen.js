@@ -1,108 +1,102 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
-  View, Text, TextInput, TouchableOpacity,
-  StyleSheet, ActivityIndicator, Alert, StatusBar,
+  View, Text, TextInput, TouchableOpacity, StyleSheet, ActivityIndicator,
   KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { io } from 'socket.io-client';
 import { BACKEND_URL } from '../config';
 import { socketStore } from '../socketStore';
 import { saveSession } from '../utils/sessionStorage';
+import { C } from '../theme';
 
-export default function DriverPairingScreen({ navigation, route: navRoute }) {
-  const resumeCode = navRoute.params?.resumeCode ?? '';
-  const [code, setCode] = useState(resumeCode);
+export default function DriverPairingScreen({ navigation, route }) {
+  const [code, setCode] = useState(route.params?.resumeCode ?? '');
   const [loading, setLoading] = useState(false);
-  const socketRef = useRef(null);
+  const [error, setError] = useState('');
+  const pendingRef = useRef(null);
 
-  const handleJoin = () => {
-    const trimmed = code.trim();
-    if (trimmed.length !== 6 || !/^\d{6}$/.test(trimmed)) {
-      Alert.alert('Błędny kod', 'Kod pokoju to 6 cyfr.');
-      return;
-    }
+  // Abandon a half-open connection if the screen is left before pairing completes.
+  useEffect(() => () => pendingRef.current?.disconnect(), []);
+
+  const join = useCallback((value) => {
+    if (loading || !/^\d{6}$/.test(value)) return;
     setLoading(true);
+    setError('');
 
-    const socket = io(BACKEND_URL, {
-      transports: ['websocket'],
-      reconnectionAttempts: 10,
-      reconnectionDelay: 2000,
-    });
-    socketRef.current = socket;
+    const socket = io(BACKEND_URL, { transports: ['websocket'], reconnectionDelay: 1500, reconnectionDelayMax: 6000 });
+    pendingRef.current = socket;
 
-    socket.on('connect', () => {
-      socket.emit('join_room', { roomCode: trimmed }, (res) => {
-        if (res.ok) {
-          socketStore.setDriver(socket);
-          saveSession('driver', trimmed);
-          setLoading(false);
-          navigation.replace('DriverMap', { roomCode: trimmed });
-        } else {
-          socket.disconnect();
-          setLoading(false);
-          Alert.alert('Błąd', res.error || 'Nie można dołączyć do pokoju.');
-        }
+    const fail = (message) => {
+      socket.disconnect();
+      pendingRef.current = null;
+      setLoading(false);
+      setError(message);
+    };
+
+    socket.once('connect', () => {
+      socket.emit('join_room', { roomCode: value }, (res) => {
+        if (!res?.ok) { fail('Nie ma pokoju o takim kodzie. Sprawdź kod u nawigatora.'); return; }
+        pendingRef.current = null;
+        socketStore.setDriver(socket);
+        saveSession({ role: 'driver', roomCode: value });
+        setLoading(false);
+        navigation.replace('DriverMap', { roomCode: value });
       });
     });
+    socket.once('connect_error', () => fail('Nie można połączyć z serwerem. Sprawdź internet i spróbuj ponownie.'));
+  }, [loading, navigation]);
 
-    socket.on('connect_error', () => {
-      setLoading(false);
-      socket.disconnect();
-      Alert.alert('Błąd połączenia', 'Nie można połączyć z serwerem.');
-    });
+  const onChange = (text) => {
+    const digits = text.replace(/\D/g, '').slice(0, 6);
+    setCode(digits);
+    setError('');
+    if (digits.length === 6) join(digits); // no need to press the button
   };
 
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'padding'}
-    >
-      <StatusBar barStyle="light-content" />
-      <Text style={styles.title}>Dołącz jako kierowca</Text>
-      <Text style={styles.subtitle}>Wpisz 6-cyfrowy kod od nawigatora</Text>
+    <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <Text style={styles.subtitle}>Wpisz 6-cyfrowy kod, który widzi nawigator</Text>
 
       <TextInput
         style={styles.codeInput}
         value={code}
-        onChangeText={(t) => setCode(t.replace(/\D/g, '').slice(0, 6))}
-        keyboardType="numeric"
+        onChangeText={onChange}
+        keyboardType="number-pad"
+        inputMode="numeric"
         maxLength={6}
         placeholder="000000"
-        placeholderTextColor="#334155"
+        placeholderTextColor="#2c313c"
         textAlign="center"
+        autoFocus
+        editable={!loading}
+        accessibilityLabel="Kod pokoju"
       />
+
+      {!!error && <Text style={styles.error}>{error}</Text>}
 
       <TouchableOpacity
         style={[styles.btn, (loading || code.length !== 6) && styles.btnDisabled]}
-        onPress={handleJoin}
+        onPress={() => join(code)}
         disabled={loading || code.length !== 6}
       >
-        {loading
-          ? <ActivityIndicator color="#fff" />
-          : <Text style={styles.btnText}>Dołącz</Text>
-        }
+        {loading ? <ActivityIndicator color={C.accentInk} /> : <Text style={styles.btnText}>Dołącz</Text>}
       </TouchableOpacity>
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1, backgroundColor: '#0f172a',
-    alignItems: 'center', justifyContent: 'center', padding: 32,
-  },
-  title: { color: '#f1f5f9', fontSize: 28, fontWeight: '700', marginBottom: 8 },
-  subtitle: { color: '#64748b', fontSize: 14, marginBottom: 40, textAlign: 'center' },
+  container: { flex: 1, backgroundColor: C.bg, alignItems: 'center', justifyContent: 'center', padding: 28 },
+  subtitle: { color: C.dim, fontSize: 15, marginBottom: 28, textAlign: 'center' },
   codeInput: {
-    backgroundColor: '#1e293b', color: '#f1f5f9',
-    fontSize: 40, fontWeight: '800', letterSpacing: 12,
-    borderRadius: 14, width: '100%', paddingVertical: 20,
-    marginBottom: 24,
+    backgroundColor: C.raised, color: C.text, fontSize: 40, fontWeight: '800', letterSpacing: 10,
+    borderRadius: 16, width: '100%', maxWidth: 420, paddingVertical: 20, marginBottom: 16,
   },
+  error: { color: C.red, fontSize: 14, textAlign: 'center', marginBottom: 16 },
   btn: {
-    backgroundColor: '#059669', borderRadius: 12,
-    paddingVertical: 16, width: '100%', alignItems: 'center',
+    backgroundColor: C.accent, borderRadius: 14, minHeight: 54, width: '100%', maxWidth: 420,
+    alignItems: 'center', justifyContent: 'center',
   },
-  btnDisabled: { backgroundColor: '#1e293b' },
-  btnText: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  btnDisabled: { opacity: 0.35 },
+  btnText: { color: C.accentInk, fontSize: 17, fontWeight: '800' },
 });

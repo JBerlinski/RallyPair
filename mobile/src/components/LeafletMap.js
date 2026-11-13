@@ -1,54 +1,42 @@
 import React, { useRef, forwardRef, useImperativeHandle, useCallback } from 'react';
 import { View, StyleSheet } from 'react-native';
 import WebView from 'react-native-webview';
-import { LEAFLET_MAP_HTML } from './leafletMapHtml';
+import { LEAFLET_MAP_HTML, MAP_METHODS } from './leafletMapHtml';
 
-// Native implementation — WebView + injectJavaScript for direct function calls
+// Native implementation — WebView, calls delivered with injectJavaScript.
+// The ref exposes every function listed in MAP_METHODS.
 
 const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) {
   const webViewRef = useRef(null);
   const readyRef = useRef(false);
   const queueRef = useRef([]);
-
-  const exec = useCallback((jsCode) => {
-    const full = jsCode + '; true;';
-    if (readyRef.current) {
-      webViewRef.current?.injectJavaScript(full);
-    } else {
-      queueRef.current.push(full);
-    }
-  }, []);
+  const handlerRef = useRef(onMapMessage);
+  handlerRef.current = onMapMessage;
 
   const onMessage = useCallback((event) => {
     const data = event.nativeEvent.data;
     if (data === 'ready') {
       readyRef.current = true;
-      const pending = queueRef.current.splice(0);
-      pending.forEach((js) => webViewRef.current?.injectJavaScript(js));
-    } else {
-      try {
-        const msg = JSON.parse(data);
-        if (msg?.t) onMapMessage?.(msg);
-      } catch {}
+      queueRef.current.splice(0).forEach((js) => webViewRef.current?.injectJavaScript(js));
+      return;
     }
-  }, [onMapMessage]);
+    try {
+      const msg = JSON.parse(data);
+      if (msg?.t) handlerRef.current?.(msg);
+    } catch {}
+  }, []);
 
-  useImperativeHandle(ref, () => ({
-    updateDriver(lat, lng, heading) {
-      const h = heading != null ? heading : 'undefined';
-      exec(`updateDriver(${lat},${lng},${h})`);
-    },
-    updateWaypoints(wps, noPan) { exec(`updateWaypoints(${JSON.stringify(wps)},${!!noPan})`); },
-    updateRoute(coords)  { exec(`updateRoute(${JSON.stringify(coords)})`); },
-    fitRoute(coords)     { exec(`fitRoute(${JSON.stringify(coords)})`); },
-    panTo(lat, lng, zoom){ exec(`panTo(${lat},${lng},${zoom != null ? zoom : 'undefined'})`); },
-    setBearing(deg)      { exec(`setBearing(${deg})`); },
-    setTileUrl(url)      { exec(`setTileUrl(${JSON.stringify(url)})`); },
-    editWaypoint(index)  { exec(`editWaypoint(${index})`); },
-    cancelEditWaypoint() { exec(`cancelEditWaypoint()`); },
-    confirmEditWaypoint(){ exec(`confirmEditWaypoint()`); },
-    setNavTilt(enable)   { exec(`setNavTilt(${!!enable})`); },
-  }), [exec]);
+  useImperativeHandle(ref, () => {
+    const api = {};
+    for (const fn of MAP_METHODS) {
+      api[fn] = (...args) => {
+        const js = `window.__call(${JSON.stringify(fn)},${JSON.stringify(args)});true;`;
+        if (readyRef.current) webViewRef.current?.injectJavaScript(js);
+        else queueRef.current.push(js);
+      };
+    }
+    return api;
+  }, []);
 
   return (
     <View style={[styles.container, style]}>
@@ -60,6 +48,7 @@ const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) 
         originWhitelist={['*']}
         scrollEnabled={false}
         bounces={false}
+        overScrollMode="never"
         onMessage={onMessage}
       />
     </View>
@@ -69,6 +58,6 @@ const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) 
 export default LeafletMap;
 
 const styles = StyleSheet.create({
-  container: { overflow: 'hidden' },
-  webview: { flex: 1, backgroundColor: '#1e293b' },
+  container: { overflow: 'hidden', backgroundColor: '#0d0f14' },
+  webview: { flex: 1, backgroundColor: '#0d0f14' },
 });

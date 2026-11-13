@@ -1,0 +1,16 @@
+export const C = {
+  bg: '#0d0f14',
+  panel: 'rgba(17,20,27,0.94)',
+  panelSolid: '#12151c',
+  raised: '#1c2029',
+  line: 'rgba(255,255,255,0.08)',
+  text: '#f4f4f5',
+  dim: '#9aa3b2',
+  faint: '#5d6676',
+  accent: '#f5a623',
+  accentInk: '#141414',
+  blue: '#3b82f6',
+  green: '#22c55e',
+  red: '#ef4444',
+  amber: '#f59e0b',
+};

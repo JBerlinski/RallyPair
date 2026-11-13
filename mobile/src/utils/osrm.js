@@ -1,49 +1,56 @@
-import { OSRM_URL } from '../config';
+import { OSRM_URL } from '../config.js';
 
-// waypoints: [{ lat, lng }, ...]
-export async function fetchRoute(waypoints) {
-  if (waypoints.length < 2) {
-    console.warn('[OSRM] Need ≥2 waypoints, got:', waypoints.length);
-    return null;
-  }
+const round5 = (n) => Math.round(n * 1e5) / 1e5;
 
-  const coords = waypoints.map((w) => `${w.lng},${w.lat}`).join(';');
-  const url = `${OSRM_URL}/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=true`;
-  console.log('[OSRM] Requesting:', url);
+// waypoints: [{ lat, lng }, ...] (at least two).
+// Resolves to { coords: [[lat, lng]…], steps, stops, distance, duration } or throws.
+//   steps — maneuvers with their distance along the route
+//   stops — distance along the route of every intermediate waypoint
+export async function fetchRoute(waypoints, { signal } = {}) {
+  if (waypoints.length < 2) throw new Error('Potrzebne są co najmniej dwa punkty');
 
-  try {
-    const res = await fetch(url);
-    const data = await res.json();
+  const path = waypoints.map((w) => `${w.lng},${w.lat}`).join(';');
+  const url = `${OSRM_URL}/route/v1/driving/${path}?overview=full&geometries=geojson&steps=true&continue_straight=false`;
 
-    if (data.code !== 'Ok' || !data.routes.length) {
-      console.warn('[OSRM] Bad response — code:', data.code, 'message:', data.message);
-      return null;
+  // The public OSRM server occasionally drops or rate-limits a request — try twice.
+  let data = null;
+  for (let attempt = 0; attempt < 2 && !data; attempt++) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1500));
+    try {
+      const res = await fetch(url, { signal });
+      data = await res.json();
+    } catch (err) {
+      if (signal?.aborted) throw err;
     }
-
-    const route = data.routes[0];
-    const coordinates = route.geometry.coordinates.map(([lng, lat]) => ({ latitude: lat, longitude: lng }));
-
-    const steps = route.legs.flatMap((leg) =>
-      leg.steps.map((step) => ({
-        instruction: step.maneuver.type,
-        modifier: step.maneuver.modifier,
-        name: step.name,
-        ref: step.ref || null,
-        distance: step.distance,
-        duration: step.duration,
-        location: {
-          latitude: step.maneuver.location[1],
-          longitude: step.maneuver.location[0],
-        },
-        bearingBefore: step.maneuver.bearing_before ?? null,
-        bearingAfter: step.maneuver.bearing_after ?? null,
-      }))
-    );
-
-    console.log('[OSRM] Route OK —', Math.round(route.distance / 1000), 'km,', steps.length, 'steps');
-    return { coordinates, steps, distance: route.distance, duration: route.duration };
-  } catch (err) {
-    console.warn('[OSRM] Fetch error:', err.message);
-    return null;
   }
+  if (!data || data.code !== 'Ok' || !data.routes?.length) {
+    throw new Error(data?.code === 'NoRoute' ? 'Nie da się wyznaczyć trasy między tymi punktami' : 'Serwer tras nie odpowiedział');
+  }
+
+  const route = data.routes[0];
+  const coords = [];
+  for (const [lng, lat] of route.geometry.coordinates) {
+    const p = [round5(lat), round5(lng)];
+    const last = coords[coords.length - 1];
+    if (!last || last[0] !== p[0] || last[1] !== p[1]) coords.push(p);
+  }
+
+  const steps = [];
+  const stops = [];
+  let d = 0;
+  route.legs.forEach((leg, legIndex) => {
+    if (legIndex > 0) stops.push({ d, index: legIndex });
+    for (const step of leg.steps) {
+      steps.push({
+        d,
+        length: step.distance,
+        type: step.maneuver.type,
+        modifier: step.maneuver.modifier || null,
+        exit: step.maneuver.exit || null,
+      });
+      d += step.distance;
+    }
+  });
+
+  return { coords, steps, stops, distance: route.distance, duration: route.duration };
 }
