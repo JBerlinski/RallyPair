@@ -1,246 +1,371 @@
-import React, { useEffect, useRef, useState } from 'react';
-import {
-  View, Text, StyleSheet, TouchableOpacity, Alert, StatusBar, ActivityIndicator,
-} from 'react-native';
+import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { View, Text, StyleSheet, StatusBar, ActivityIndicator } from 'react-native';
+import { useFocusEffect } from '@react-navigation/native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
 import LeafletMap from '../components/LeafletMap';
+import PacenoteStrip from '../components/PacenoteStrip';
+import StartCountdown from '../components/StartCountdown';
+import RoundButton from '../components/RoundButton';
+import { C } from '../theme';
 import { socketStore } from '../socketStore';
 import { clearSession } from '../utils/sessionStorage';
-import { fetchRoute } from '../utils/osrm';
+import { loadSettings, saveSettings, getCachedSettings, tileArgs } from '../utils/settings';
+import { useScreenAwake } from '../utils/useScreenAwake';
+import { cumulative, snapToRoute, pointAt, bearingAt, angDiff } from '../utils/geo';
+import { withGaps, callState } from '../utils/pacenotes';
+import { mapNotesPayload } from '../utils/roadbook';
+import { notify, confirm } from '../utils/dialogs';
 
-const POSITION_INTERVAL_MS = 3000;
+const NAV_ZOOM = 17;
+const ON_ROUTE_M = 40;     // further than this from the route = off route
+const SNAP_M = 25;         // within this, the car is drawn exactly on the route
+const SEND_INTERVAL_MS = 1000;
 
-export default function DriverMapScreen({ route }) {
+export default function DriverMapScreen({ navigation, route }) {
+  useScreenAwake();
   const { roomCode } = route.params;
+  const insets = useSafeAreaInsets();
   const socket = socketStore.getDriver();
+
   const mapRef = useRef(null);
-  const locationSubRef = useRef(null);
+  const stageRef = useRef(null);       // { rb, cum, notes } for the current roadbook
+  const fixRef = useRef(null);         // last raw GPS fix
+  const compassRef = useRef(null);
+  const headingRef = useRef(0);
+  const progressRef = useRef(null);
+  const drawnProgressRef = useRef(-100);
   const lastSentRef = useRef(0);
-  const lastPositionRef = useRef(null);
-  const routeCoordsRef = useRef([]);
-  const needsRejoinRef = useRef(false);
+  const lastCompassDrawRef = useRef(0);
+  const modeRef = useRef('follow');    // follow | free | overview
+  const headingUpRef = useRef(getCachedSettings().headingUp);
+  const leavingRef = useRef(false);
 
-  const [connected, setConnected] = useState(true);
-  const [reconnecting, setReconnecting] = useState(false);
-  const [statusMsg, setStatusMsg] = useState('Czekam na trasę od nawigatora…');
-  const [currentStep, setCurrentStep] = useState(null);
-  const [overview, setOverview] = useState(false);
+  const [roadbook, setRoadbook] = useState(null);
+  const [progress, setProgress] = useState(null);
+  const [offRoute, setOffRoute] = useState(false);
+  const [gps, setGps] = useState('waiting'); // waiting | ok | denied
+  const [online, setOnline] = useState(socket?.connected ?? false);
+  const [navigatorOnline, setNavigatorOnline] = useState(true);
+  const [mode, setModeState] = useState('follow');
+  const [headingUp, setHeadingUp] = useState(headingUpRef.current);
+  const [tilt, setTilt] = useState(getCachedSettings().tilt);
+  const [countdown, setCountdown] = useState(null);
 
-  // GPS tracking
-  useEffect(() => {
-    let active = true;
-    (async () => {
-      const { status } = await Location.requestForegroundPermissionsAsync();
-      if (status !== 'granted') { console.warn('[GPS] Permission denied'); return; }
-      if (!active) return;
+  const notes = useMemo(() => (roadbook ? withGaps(roadbook.notes) : []), [roadbook?.notes]); // eslint-disable-line react-hooks/exhaustive-deps
+  const call = useMemo(() => (progress != null && notes.length ? callState(notes, progress) : undefined), [notes, progress]);
 
-      locationSubRef.current = await Location.watchPositionAsync(
-        { accuracy: Location.Accuracy.High, timeInterval: POSITION_INTERVAL_MS, distanceInterval: 5 },
-        (loc) => {
-          if (!active) return;
-          const { latitude, longitude } = loc.coords;
+  const setMode = useCallback((next) => { modeRef.current = next; setModeState(next); }, []);
 
-          mapRef.current?.updateDriver(latitude, longitude);
-          lastPositionRef.current = { lat: latitude, lng: longitude };
+  // ── Position handling ─────────────────────────────────────────────────────
+  // Works out where the car is on the stage, moves the map and tells the navigator.
+  const processFix = useCallback((force = false) => {
+    const fix = fixRef.current;
+    if (!fix) return;
+    const stage = stageRef.current;
+    const moving = (fix.speed ?? 0) > 1.5;
+    let heading = headingRef.current;
+    if (moving && fix.course != null && fix.course >= 0) heading = fix.course;
+    else if (!moving && compassRef.current != null) heading = compassRef.current;
 
-          const now = Date.now();
-          if (now - lastSentRef.current < POSITION_INTERVAL_MS) return;
-          lastSentRef.current = now;
-          socket?.emit('send_position', { lat: latitude, lng: longitude });
-        },
-      );
-    })();
-    return () => {
-      active = false;
-      locationSubRef.current?.remove();
-    };
-  }, [socket]);
+    let shown = [fix.lat, fix.lng];
+    let d = null;
+    if (stage) {
+      const snap = snapToRoute(stage.rb.coords, stage.cum, shown, progressRef.current);
+      if (snap.off <= ON_ROUTE_M) {
+        d = snap.d;
+        if (snap.off <= SNAP_M) shown = pointAt(stage.rb.coords, stage.cum, d);
+        // The road's own direction is steadier than GPS course or a compass in a car.
+        heading = bearingAt(stage.rb.coords, stage.cum, Math.min(d + 6, stage.rb.distance));
+      }
+      setOffRoute(snap.off > ON_ROUTE_M);
+    }
+    headingRef.current = heading;
+    progressRef.current = d;
 
-  // WebSocket listeners + reconnect logic
-  useEffect(() => {
-    if (!socket) {
-      setStatusMsg('Brak połączenia z serwerem.');
-      return;
+    if (modeRef.current === 'follow') mapRef.current?.follow(shown[0], shown[1], heading, NAV_ZOOM, headingUpRef.current);
+    else mapRef.current?.setDriver(shown[0], shown[1], heading);
+
+    if (d != null) {
+      if (force || Math.abs(d - drawnProgressRef.current) >= 4) {
+        drawnProgressRef.current = d;
+        mapRef.current?.setProgress(d);
+      }
+      setProgress(Math.round(d / 5) * 5);
+    } else {
+      setProgress(null);
     }
 
-    const onRouteUpdate = async (payload) => {
-      const { waypoints: wps } = payload;
-      console.log('[DriverMap] route_update, waypoints:', wps?.length ?? 0);
-      if (!wps?.length) return;
+    const now = Date.now();
+    if (force || now - lastSentRef.current >= SEND_INTERVAL_MS) {
+      lastSentRef.current = now;
+      socket?.volatile.emit('send_position', {
+        lat: shown[0], lng: shown[1], heading: Math.round(heading), d,
+        routeId: stage ? stage.rb.id : null,
+      });
+    }
+  }, [socket]);
 
-      setStatusMsg('Wyznaczam trasę…');
-      mapRef.current?.updateWaypoints(wps);
+  useEffect(() => {
+    let active = true;
+    let positionSub = null;
+    let headingSub = null;
 
-      const origin = lastPositionRef.current;
-      const routePoints = origin ? [origin, ...wps] : wps;
-      console.log('[DriverMap] fetchRoute with', routePoints.length, 'points, origin:', !!origin);
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync().catch(() => ({ status: 'denied' }));
+      if (!active) return;
+      if (status !== 'granted') { setGps('denied'); return; }
 
-      const result = await fetchRoute(routePoints);
-      if (!result) {
-        setStatusMsg(origin
-          ? 'Nie udało się wyznaczyć trasy — sprawdź połączenie.'
-          : 'Oczekuję na sygnał GPS przed wyznaczeniem trasy…');
-        return;
+      try {
+        positionSub = await Location.watchPositionAsync(
+          { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 1 },
+          (loc) => {
+            if (!active) return;
+            fixRef.current = {
+              lat: loc.coords.latitude, lng: loc.coords.longitude,
+              speed: loc.coords.speed, course: loc.coords.heading,
+            };
+            setGps('ok');
+            processFix();
+          },
+        );
+      } catch {
+        if (active) setGps('denied');
       }
 
-      routeCoordsRef.current = result.coordinates;
-      setCurrentStep(result.steps[0] ?? null);
-      setStatusMsg('');
-      mapRef.current?.updateRoute(result.coordinates);
-      mapRef.current?.fitRoute(result.coordinates);
-
-      try { await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning); } catch {}
-      Alert.alert('Nowa trasa', `Cel: ${wps[wps.length - 1].label || 'zaktualizowany'}`);
-    };
-
-    const onRoomClosed = () => {
-      setConnected(false);
-      clearSession();
-      Alert.alert('Rozłączono', 'Nawigator zakończył sesję.');
-    };
-
-    const onNavigatorReconnecting = () => {
-      setStatusMsg('Nawigator się rozłączył, próba ponownego połączenia…');
-    };
-
-    const onNavigatorRejoined = () => {
-      setStatusMsg('Nawigator ponownie połączony.');
-      setTimeout(() => setStatusMsg(''), 2000);
-    };
-
-    const onDisconnect = () => {
-      needsRejoinRef.current = true;
-      setConnected(false);
-      setReconnecting(true);
-    };
-
-    const onConnect = () => {
-      setConnected(true);
-      if (needsRejoinRef.current) {
-        needsRejoinRef.current = false;
-        socket.emit('rejoin_driver', { roomCode }, (res) => {
-          setReconnecting(false);
-          if (!res?.ok) {
-            clearSession();
-            Alert.alert('Sesja wygasła', 'Pokój nie istnieje. Wróć do menu.', [
-              { text: 'OK', onPress: () => {} },
-            ]);
-            setStatusMsg('Sesja wygasła.');
-          } else {
-            setStatusMsg('');
-          }
+      // Compass: only used while standing still away from the route. Not available on web.
+      try {
+        headingSub = await Location.watchHeadingAsync((h) => {
+          const value = h.trueHeading >= 0 ? h.trueHeading : h.magHeading;
+          if (!(value >= 0)) return;
+          compassRef.current = value;
+          const fix = fixRef.current;
+          const now = Date.now();
+          if (!fix || (fix.speed ?? 0) > 1.5 || progressRef.current != null) return;
+          if (now - lastCompassDrawRef.current < 300 || Math.abs(angDiff(headingRef.current, value)) < 4) return;
+          lastCompassDrawRef.current = now;
+          processFix();
         });
-      } else {
-        setReconnecting(false);
-      }
+      } catch {}
+      if (!active) { positionSub?.remove(); headingSub?.remove(); }
+    })();
+
+    return () => { active = false; positionSub?.remove(); headingSub?.remove(); };
+  }, [processFix]);
+
+  // ── Roadbook from the navigator ───────────────────────────────────────────
+  const drawNotes = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage) { mapRef.current?.setNotes([], [], false); return; }
+    const markers = getCachedSettings().driverMarkers;
+    mapRef.current?.setNotes(...mapNotesPayload(stage.rb, stage.cum, { markers }), false);
+  }, []);
+
+  const applyRoadbook = useCallback((rb) => {
+    const previousId = stageRef.current?.rb.id;
+    if (!rb) {
+      stageRef.current = null;
+      progressRef.current = null;
+      mapRef.current?.setRoute([]);
+      drawNotes();
+      setRoadbook(null); setProgress(null); setOffRoute(false);
+      return;
+    }
+    const sameRoute = previousId === rb.id;
+    stageRef.current = { rb, cum: sameRoute ? stageRef.current.cum : cumulative(rb.coords) };
+    if (!sameRoute) {
+      progressRef.current = null;
+      drawnProgressRef.current = -100;
+      mapRef.current?.setRoute(rb.coords);
+    }
+    drawNotes();
+    setRoadbook(rb);
+    if (fixRef.current) processFix(true);
+    else if (!sameRoute) mapRef.current?.fit(rb.coords, 80, 200); // no GPS yet: show the stage until the first fix
+  }, [drawNotes, processFix]);
+
+  useEffect(() => {
+    if (!socket) { notify('Brak połączenia', 'Wróć i dołącz do pokoju ponownie.'); return undefined; }
+
+    const leave = (title, message) => {
+      if (leavingRef.current) return;
+      leavingRef.current = true;
+      clearSession();
+      notify(title, message);
+      navigation.goBack();
     };
 
-    socket.on('route_update', onRouteUpdate);
-    socket.on('room_closed', onRoomClosed);
-    socket.on('navigator_reconnecting', onNavigatorReconnecting);
-    socket.on('navigator_rejoined', onNavigatorRejoined);
+    // Joining returns the current roadbook, so the same call covers first entry and reconnects.
+    const join = () => socket.emit('join_room', { roomCode }, (res) => {
+      if (!res?.ok) { leave('Sesja wygasła', 'Pokój już nie istnieje. Poproś nawigatora o nowy kod.'); return; }
+      setOnline(true);
+      setNavigatorOnline(res.hasNavigator);
+      applyRoadbook(res.roadbook);
+    });
+
+    const onRoadbook = (rb) => {
+      const isNew = rb && rb.id !== stageRef.current?.rb.id;
+      applyRoadbook(rb);
+      if (isNew) Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+    };
+    const onNotes = ({ routeId, notes: next }) => {
+      const stage = stageRef.current;
+      if (stage && stage.rb.id === routeId) applyRoadbook({ ...stage.rb, notes: next });
+    };
+    const onCountdown = ({ seconds }) => setCountdown({ seconds, at: Date.now() });
+    const onDisconnect = () => setOnline(false);
+    const onNavGone = () => setNavigatorOnline(false);
+    const onNavBack = () => setNavigatorOnline(true);
+    const onClosed = () => leave('Rozłączono', 'Sesja wygasła z powodu braku aktywności.');
+    const onReplaced = () => leave('Sesja przejęta', 'Do tego pokoju dołączył inny kierowca.');
+
+    socket.on('connect', join);
     socket.on('disconnect', onDisconnect);
-    socket.on('connect', onConnect);
+    socket.on('roadbook', onRoadbook);
+    socket.on('notes_update', onNotes);
+    socket.on('countdown', onCountdown);
+    socket.on('navigator_reconnecting', onNavGone);
+    socket.on('navigator_rejoined', onNavBack);
+    socket.on('room_closed', onClosed);
+    socket.on('replaced', onReplaced);
+    if (socket.connected) join();
 
     return () => {
-      socket.off('route_update', onRouteUpdate);
-      socket.off('room_closed', onRoomClosed);
-      socket.off('navigator_reconnecting', onNavigatorReconnecting);
-      socket.off('navigator_rejoined', onNavigatorRejoined);
+      socket.off('connect', join);
       socket.off('disconnect', onDisconnect);
-      socket.off('connect', onConnect);
+      socket.off('roadbook', onRoadbook);
+      socket.off('notes_update', onNotes);
+      socket.off('countdown', onCountdown);
+      socket.off('navigator_reconnecting', onNavGone);
+      socket.off('navigator_rejoined', onNavBack);
+      socket.off('room_closed', onClosed);
+      socket.off('replaced', onReplaced);
       socket.disconnect();
       socketStore.clearDriver();
     };
-  }, [socket, roomCode]);
+  }, [socket, roomCode, navigation, applyRoadbook]);
 
-  const handleOverviewToggle = () => {
-    setOverview((v) => {
-      const next = !v;
-      if (next && routeCoordsRef.current.length > 0) mapRef.current?.fitRoute(routeCoordsRef.current);
-      return next;
+  useEffect(() => navigation.addListener('beforeRemove', (e) => {
+    if (leavingRef.current) return;
+    e.preventDefault();
+    confirm('Opuścić sesję?', 'Przestaniesz widzieć trasę i notatki nawigatora.', () => {
+      leavingRef.current = true;
+      clearSession();
+      navigation.dispatch(e.data.action);
+    }, 'Opuść');
+  }), [navigation]);
+
+  // ── Settings (re-read whenever the screen regains focus) ──────────────────
+  useFocusEffect(useCallback(() => {
+    loadSettings().then((s) => {
+      mapRef.current?.setTiles(...tileArgs(s));
+      mapRef.current?.setTilt(s.tilt);
+      headingUpRef.current = s.headingUp;
+      setHeadingUp(s.headingUp); setTilt(s.tilt);
+      drawNotes();
+      processFix(true);
     });
-  };
+  }, [drawNotes, processFix]));
+
+  // ── Controls ──────────────────────────────────────────────────────────────
+  const recenter = useCallback(() => { setMode('follow'); processFix(true); }, [setMode, processFix]);
+
+  const toggleOverview = useCallback(() => {
+    if (modeRef.current === 'overview') { recenter(); return; }
+    const stage = stageRef.current;
+    if (!stage) return;
+    setMode('overview');
+    mapRef.current?.fit(stage.rb.coords, 80, 220);
+  }, [recenter, setMode]);
+
+  const toggleHeadingUp = useCallback(() => {
+    const next = !headingUpRef.current;
+    headingUpRef.current = next; setHeadingUp(next);
+    saveSettings({ headingUp: next });
+    recenter();
+  }, [recenter]);
+
+  const toggleTilt = useCallback(() => {
+    setTilt((cur) => {
+      saveSettings({ tilt: !cur });
+      mapRef.current?.setTilt(!cur);
+      return !cur;
+    });
+  }, []);
+
+  const onMapMessage = useCallback((msg) => {
+    if (msg.t === 'userPan') setMode('free');
+  }, [setMode]);
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  let status = null;
+  if (!online) status = { text: 'Przywracanie połączenia…', busy: true, tone: C.amber };
+  else if (gps === 'denied') status = { text: 'Brak dostępu do lokalizacji — włącz ją w ustawieniach telefonu', tone: C.red };
+  else if (gps === 'waiting') status = { text: 'Szukam sygnału GPS…', busy: true, tone: C.dim };
+  else if (!roadbook) status = { text: 'Czekam na trasę od nawigatora…', tone: C.dim };
+  else if (offRoute) status = { text: 'Poza trasą', tone: C.red };
+  else if (!navigatorOnline) status = { text: 'Nawigator rozłączony', tone: C.amber };
 
   return (
     <View style={styles.container}>
       <StatusBar hidden />
-      <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} />
+      <LeafletMap ref={mapRef} style={StyleSheet.absoluteFill} onMapMessage={onMapMessage} />
 
-      <View style={styles.topBar}>
-        <Text style={styles.roomCode}>Pokój: {roomCode}</Text>
-        {reconnecting
-          ? <ActivityIndicator size="small" color="#f59e0b" />
-          : <View style={[styles.dot, connected ? styles.dotGreen : styles.dotRed]} />}
+      <View style={[styles.topLeft, { top: insets.top + 10 }]}>
+        <RoundButton icon="back" label="Opuść sesję" onPress={() => navigation.goBack()} />
+        <View style={styles.roomChip}>
+          <View style={[styles.dot, { backgroundColor: online ? C.green : C.amber }]} />
+          <Text style={styles.roomCode}>{roomCode}</Text>
+        </View>
       </View>
 
-      {reconnecting && (
-        <View style={styles.reconnectBanner}>
-          <Text style={styles.reconnectText}>Przywracanie połączenia…</Text>
+      <View style={[styles.topRight, { top: insets.top + 10 }]}>
+        <RoundButton icon="route" label="Cała trasa" active={mode === 'overview'} onPress={toggleOverview} />
+        <RoundButton icon="north" label="Mapa zgodnie z kierunkiem jazdy" active={headingUp} onPress={toggleHeadingUp} />
+        <RoundButton icon="cube" label="Widok 3D" active={tilt} onPress={toggleTilt} />
+        <RoundButton icon="settings" label="Ustawienia" onPress={() => navigation.navigate('Settings')} />
+      </View>
+
+      {status && (
+        <View style={[styles.status, { top: insets.top + 64 }]}>
+          {status.busy && <ActivityIndicator size="small" color={status.tone} />}
+          <Text style={[styles.statusText, { color: status.tone }]}>{status.text}</Text>
         </View>
       )}
 
-      {currentStep && !overview && !reconnecting && (
-        <View style={styles.instructionBox}>
-          <Text style={styles.instructionText}>
-            {currentStep.modifier
-              ? `${currentStep.instruction} ${currentStep.modifier}`
-              : currentStep.instruction}
-            {currentStep.name ? ` → ${currentStep.name}` : ''}
-          </Text>
-          <Text style={styles.instructionDist}>{Math.round(currentStep.distance)} m</Text>
-        </View>
-      )}
+      <View style={[styles.bottom, { paddingBottom: insets.bottom + 10 }]} pointerEvents="box-none">
+        {mode !== 'follow' && gps === 'ok' && (
+          <RoundButton icon="locate" label="Wróć do jazdy" active size={52} style={styles.recenter} onPress={recenter} />
+        )}
+        {roadbook && call !== undefined && (
+          <PacenoteStrip notes={notes} call={call} remaining={roadbook.distance - progress} size="lg" />
+        )}
+      </View>
 
-      {statusMsg !== '' && !reconnecting && (
-        <View style={styles.statusBox}>
-          <Text style={styles.statusText}>{statusMsg}</Text>
-        </View>
-      )}
-
-      <TouchableOpacity style={styles.overviewBtn} onPress={handleOverviewToggle}>
-        <Text style={styles.overviewBtnText}>{overview ? '📍 Nawigacja' : '🗺 Cała mapa'}</Text>
-      </TouchableOpacity>
+      <StartCountdown start={countdown} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
-  topBar: {
-    position: 'absolute', top: 12, left: 12, right: 12,
-    flexDirection: 'row', alignItems: 'center',
-    backgroundColor: 'rgba(15,23,42,0.85)', borderRadius: 10,
-    paddingHorizontal: 14, paddingVertical: 8,
+  container: { flex: 1, backgroundColor: C.bg },
+  topLeft: { position: 'absolute', left: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  topRight: { position: 'absolute', right: 10, gap: 8 },
+  roomChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 7, height: 34, paddingHorizontal: 12,
+    backgroundColor: C.panel, borderRadius: 17, borderWidth: 1, borderColor: C.line,
   },
-  roomCode: { color: '#94a3b8', fontSize: 13, flex: 1 },
-  dot: { width: 10, height: 10, borderRadius: 5 },
-  dotGreen: { backgroundColor: '#22c55e' },
-  dotRed: { backgroundColor: '#ef4444' },
-  reconnectBanner: {
-    position: 'absolute', top: 52, left: 12, right: 12,
-    backgroundColor: '#78350f', borderRadius: 8,
-    padding: 10, alignItems: 'center',
+  dot: { width: 8, height: 8, borderRadius: 4 },
+  roomCode: { color: C.dim, fontSize: 13, fontWeight: '700', letterSpacing: 1.5 },
+
+  status: {
+    position: 'absolute', left: 10, right: 64, flexDirection: 'row', alignItems: 'center', gap: 8,
+    backgroundColor: C.panel, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10,
+    borderWidth: 1, borderColor: C.line,
   },
-  reconnectText: { color: '#fef3c7', fontSize: 13 },
-  instructionBox: {
-    position: 'absolute', bottom: 90, left: 12, right: 12,
-    backgroundColor: 'rgba(15,23,42,0.92)', borderRadius: 14,
-    padding: 16, flexDirection: 'row', alignItems: 'center',
-  },
-  instructionText: { color: '#f1f5f9', fontSize: 15, fontWeight: '600', flex: 1 },
-  instructionDist: { color: '#3b82f6', fontSize: 15, fontWeight: '700', marginLeft: 8 },
-  statusBox: {
-    position: 'absolute', bottom: 90, left: 12, right: 12,
-    backgroundColor: 'rgba(15,23,42,0.85)', borderRadius: 12,
-    padding: 14, alignItems: 'center',
-  },
-  statusText: { color: '#94a3b8', fontSize: 14 },
-  overviewBtn: {
-    position: 'absolute', bottom: 28, right: 16,
-    backgroundColor: 'rgba(15,23,42,0.9)', borderRadius: 24,
-    paddingHorizontal: 18, paddingVertical: 12,
-  },
-  overviewBtnText: { color: '#f1f5f9', fontSize: 14, fontWeight: '600' },
+  statusText: { flex: 1, fontSize: 14, fontWeight: '700' },
+
+  bottom: { position: 'absolute', left: 10, right: 10, bottom: 0 },
+  recenter: { alignSelf: 'flex-end', marginBottom: 10 },
 });

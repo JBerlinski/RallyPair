@@ -1,55 +1,47 @@
 import React, { useRef, forwardRef, useImperativeHandle, useEffect } from 'react';
-import { LEAFLET_MAP_HTML } from './leafletMapHtml';
+import { LEAFLET_MAP_HTML, MAP_METHODS } from './leafletMapHtml';
 
-// Web implementation — <iframe srcDoc> + postMessage
-// Metro picks this file on web; LeafletMap.js (WebView) is used on native
+// Web implementation — <iframe srcDoc>, calls delivered with postMessage.
+// The ref exposes every function listed in MAP_METHODS.
 
-const LeafletMap = forwardRef(function LeafletMap({ style }, ref) {
+const LeafletMap = forwardRef(function LeafletMap({ style, onMapMessage }, ref) {
   const iframeRef = useRef(null);
   const readyRef = useRef(false);
   const queueRef = useRef([]);
+  const handlerRef = useRef(onMapMessage);
+  handlerRef.current = onMapMessage;
 
   useEffect(() => {
     const handler = (event) => {
+      if (event.source !== iframeRef.current?.contentWindow) return;
       if (event.data === 'ready') {
         readyRef.current = true;
-        const pending = queueRef.current.splice(0);
-        pending.forEach((msg) => {
-          iframeRef.current?.contentWindow?.postMessage(msg, '*');
-        });
+        queueRef.current.splice(0).forEach((m) => iframeRef.current?.contentWindow?.postMessage(m, '*'));
+        return;
       }
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg?.t) handlerRef.current?.(msg);
+      } catch {}
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
   }, []);
 
-  function send(obj) {
-    const msg = JSON.stringify(obj);
-    if (readyRef.current) {
-      iframeRef.current?.contentWindow?.postMessage(msg, '*');
-    } else {
-      queueRef.current.push(msg);
+  useImperativeHandle(ref, () => {
+    const api = {};
+    for (const fn of MAP_METHODS) {
+      api[fn] = (...args) => {
+        const msg = JSON.stringify({ fn, args });
+        if (readyRef.current) iframeRef.current?.contentWindow?.postMessage(msg, '*');
+        else queueRef.current.push(msg);
+      };
     }
-  }
-
-  useImperativeHandle(ref, () => ({
-    updateDriver(lat, lng) { send({ t: 'driver', lat, lng }); },
-    updateWaypoints(wps) { send({ t: 'waypoints', wps }); },
-    updateRoute(coords) { send({ t: 'route', coords }); },
-    fitRoute(coords) { send({ t: 'fit', coords }); },
-    panTo(lat, lng, zoom) { send({ t: 'pan', lat, lng, zoom }); },
-  }));
-
-  const containerStyle = {
-    width: '100%',
-    height: '100%',
-    overflow: 'hidden',
-    backgroundColor: '#1e293b',
-    ...(style || {}),
-  };
+    return api;
+  }, []);
 
   return (
-    <div style={containerStyle}>
+    <div style={{ width: '100%', height: '100%', overflow: 'hidden', backgroundColor: '#0d0f14', ...(style || {}) }}>
       <iframe
         ref={iframeRef}
         srcDoc={LEAFLET_MAP_HTML}
