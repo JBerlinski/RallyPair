@@ -1,9 +1,9 @@
 import React from 'react';
 import { View, Text, TextInput, TouchableOpacity, ScrollView, StyleSheet } from 'react-native';
-import { Tile } from './PaceTiles';
+import { Tile, NoteTiles } from './PaceTiles';
 import Icon from './Icon';
 import { arrowSpec, tagSpec, modSpec } from '../utils/paceIcons';
-import { GRADES, GRADE_INFO, MODS, TAGS, HAZARD_TAGS } from '../utils/pacenotes';
+import { GRADES, GRADE_INFO, MODS, TAGS, HAZARD_TAGS, noteText } from '../utils/pacenotes';
 import { fmtDistance } from '../utils/geo';
 import { C } from '../theme';
 
@@ -21,7 +21,8 @@ function Choice({ spec, label, selected, onPress, size = 44 }) {
 }
 
 // Edits one pacenote. Every change is applied (and synced to the driver) immediately.
-export default function NoteEditor({ note, onChange, onMove, onDelete, onClose }) {
+// When collapsed it shrinks to a single row so the map underneath stays visible.
+export default function NoteEditor({ note, onChange, onMove, onDelete, onClose, collapsed, onToggleCollapse }) {
   const isCorner = note.kind === 'corner';
   const dir = note.dir || 'R';
   const tags = note.tags || [];
@@ -32,6 +33,23 @@ export default function NoteEditor({ note, onChange, onMove, onDelete, onClose }
     if (kind === 'corner') onChange({ kind, dir, grade: note.grade || '4' });
     else onChange({ kind, mods: [], tags: tags.length ? tags : ['caution'] });
   };
+
+  if (collapsed) {
+    return (
+      <View style={styles.header}>
+        <TouchableOpacity style={styles.mini} onPress={onToggleCollapse} accessibilityLabel={`Rozwiń edycję: ${noteText(note)}`}>
+          <Text style={styles.miniKm}>{fmtDistance(note.d)}</Text>
+          <NoteTiles note={note} size={30} max={4} gap={3} showGap={false} />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.iconBtn} onPress={onToggleCollapse} accessibilityLabel="Rozwiń panel">
+          <Icon name="chevUp" color={C.dim} />
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.iconBtn, styles.done]} onPress={onClose} accessibilityLabel="Gotowe">
+          <Icon name="check" color={C.accentInk} />
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   return (
     <View>
@@ -45,6 +63,9 @@ export default function NoteEditor({ note, onChange, onMove, onDelete, onClose }
         </View>
         <TouchableOpacity style={styles.iconBtn} onPress={onDelete} accessibilityLabel="Usuń notatkę">
           <Icon name="trash" color={C.red} />
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.iconBtn} onPress={onToggleCollapse} accessibilityLabel="Schowaj panel">
+          <Icon name="chevDown" color={C.dim} />
         </TouchableOpacity>
         <TouchableOpacity style={[styles.iconBtn, styles.done]} onPress={onClose} accessibilityLabel="Gotowe">
           <Icon name="check" color={C.accentInk} />
@@ -119,7 +140,9 @@ export default function NoteEditor({ note, onChange, onMove, onDelete, onClose }
 }
 
 const styles = StyleSheet.create({
-  header: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingTop: 12, paddingBottom: 8 },
+  header: { flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 14, paddingTop: 6, paddingBottom: 8 },
+  mini: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 42, overflow: 'hidden' },
+  miniKm: { color: C.text, fontSize: 14, fontWeight: '700' },
   segment: { flex: 1, flexDirection: 'row', backgroundColor: C.raised, borderRadius: 10, padding: 3 },
   segBtn: { flex: 1, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
   segOn: { backgroundColor: C.accent },

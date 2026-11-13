@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, ActivityIndicator,
-  StatusBar, Platform, KeyboardAvoidingView, Share, useWindowDimensions,
+  StatusBar, Platform, Share, useWindowDimensions,
 } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -13,6 +13,7 @@ import { searchPlaces, reverseGeocode } from '../utils/parseLocation';
 import { saveSession, loadSession, clearSession, saveDraft, loadDraft } from '../utils/sessionStorage';
 import { loadSettings, tileArgs } from '../utils/settings';
 import { useScreenAwake } from '../utils/useScreenAwake';
+import { useKeyboardInset } from '../utils/useKeyboardInset';
 import { cumulative, pointAt, snapToRoute, fmtDistance } from '../utils/geo';
 import { withGaps, callState, sortNotes, noteId, noteText, applyFeatures } from '../utils/pacenotes';
 import { buildRoadbook, mapNotesPayload, countCorners } from '../utils/roadbook';
@@ -33,6 +34,7 @@ export default function NavigatorScreen({ navigation }) {
   useScreenAwake();
   const insets = useSafeAreaInsets();
   const { height: winHeight } = useWindowDimensions();
+  const keyboardInset = useKeyboardInset(insets.bottom);
 
   const socketRef = useRef(null);
   const mapRef = useRef(null);
@@ -496,13 +498,19 @@ export default function NavigatorScreen({ navigation }) {
         </View>
       )}
 
-      {/* Bottom sheet */}
-      <KeyboardAvoidingView
-        style={styles.sheetWrap}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-        pointerEvents="box-none"
-      >
-        <View style={[styles.sheet, { paddingBottom: insets.bottom + 10 }]}>
+      {/* Bottom sheet — always pinned to the bottom edge, lifted only while the keyboard is open */}
+      <View style={[styles.sheetWrap, { bottom: keyboardInset }]} pointerEvents="box-none">
+        <View style={[styles.sheet, { paddingBottom: keyboardInset ? 10 : insets.bottom + 10 }]}>
+          {!pending && (
+            <TouchableOpacity
+              style={styles.grabber}
+              onPress={() => setCollapsed((c) => !c)}
+              hitSlop={{ top: 8, bottom: 4 }}
+              accessibilityLabel={collapsed ? 'Rozwiń panel' : 'Schowaj panel'}
+            >
+              <View style={styles.grabberBar} />
+            </TouchableOpacity>
+          )}
           {pending ? (
             <View style={styles.pending}>
               <Text style={styles.pendingTitle}>Co dodać w tym miejscu?</Text>
@@ -523,6 +531,8 @@ export default function NavigatorScreen({ navigation }) {
               onMove={(delta) => moveNote(editing.id, delta)}
               onDelete={() => deleteNote(editing.id)}
               onClose={() => setEditingId(null)}
+              collapsed={collapsed}
+              onToggleCollapse={() => setCollapsed((c) => !c)}
             />
           ) : (
             <>
@@ -650,7 +660,7 @@ export default function NavigatorScreen({ navigation }) {
             </>
           )}
         </View>
-      </KeyboardAvoidingView>
+      </View>
 
       <StartCountdown start={countdown} />
     </View>
@@ -682,12 +692,14 @@ const styles = StyleSheet.create({
   },
   toastText: { color: C.accentInk, fontSize: 13, fontWeight: '700' },
 
-  sheetWrap: { position: 'absolute', left: 0, right: 0, bottom: 0, top: 0, justifyContent: 'flex-end', zIndex: 12 },
+  sheetWrap: { position: 'absolute', left: 0, right: 0, bottom: 0, zIndex: 12 },
   sheet: {
     backgroundColor: C.panelSolid, borderTopLeftRadius: 18, borderTopRightRadius: 18,
     borderTopWidth: 1, borderColor: C.line,
   },
-  tabs: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingTop: 8, gap: 6 },
+  grabber: { alignItems: 'center', paddingTop: 7, paddingBottom: 1 },
+  grabberBar: { width: 38, height: 4, borderRadius: 2, backgroundColor: C.faint },
+  tabs: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingTop: 2, gap: 6 },
   tab: { paddingHorizontal: 16, paddingVertical: 9, borderRadius: 18 },
   tabOn: { backgroundColor: C.raised },
   tabText: { color: C.dim, fontSize: 14, fontWeight: '700' },
